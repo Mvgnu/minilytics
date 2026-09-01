@@ -9,6 +9,8 @@ export type MinilyticsOptions = {
   autoPageviews?: boolean;
   autoClicks?: boolean;
   autoForms?: boolean;
+  autoEngagement?: boolean;
+  autoWebVitals?: boolean;
   visitorMode?: VisitorMode;
 };
 
@@ -41,9 +43,22 @@ type EventPayload = {
   properties?: EventProperties;
 };
 
+type EventTarget = Pick<EventPayload, "targetUrl" | "targetLabel">;
+
+type VitalMetric = {
+  name: string;
+  value: number;
+  delta: number;
+  id: string;
+  rating?: string;
+  navigationType?: string;
+};
+
 const SESSION_KEY = "minilytics.session.v1";
 const VISITOR_KEY = "minilytics.visitor.v1";
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+const ENGAGEMENT_FLUSH_MS = 15_000;
+const MIN_ENGAGEMENT_MS = 100;
 const MAX_PROPERTIES_BYTES = 4096;
 const DOWNLOAD_EXTENSIONS = /\.(?:7z|avi|csv|docx?|exe|gz|mov|mp3|mp4|pdf|pptx?|rar|tar|wav|xlsx?|zip)$/i;
 
@@ -141,6 +156,8 @@ export function createTracker(options: MinilyticsOptions = {}) {
   const autoPageviews = options.autoPageviews ?? true;
   const autoClicks = options.autoClicks ?? true;
   const autoForms = options.autoForms ?? true;
+  const autoEngagement = options.autoEngagement ?? true;
+  const autoWebVitals = options.autoWebVitals ?? true;
   const visitorMode = options.visitorMode ?? "session";
 
   let session =
@@ -151,7 +168,12 @@ export function createTracker(options: MinilyticsOptions = {}) {
       attribution: initialAttribution(),
     } satisfies SessionState);
 
+  let currentPath = cleanPath(new URL(window.location.href));
   let lastPage = "";
+  let activeStarted: number | null = null;
+  let pendingEngagementMs = 0;
+  let engagementTimer: ReturnType<typeof setInterval> | undefined;
+  let stopped = false;
 
   function touchSession() {
     if (Date.now() - session.lastSeen > SESSION_TIMEOUT_MS) {
@@ -186,10 +208,11 @@ export function createTracker(options: MinilyticsOptions = {}) {
     }).catch(() => {});
   }
 
-  function track(
+  function emit(
     eventType: string,
     properties?: EventProperties,
-    extra: Pick<EventPayload, "targetUrl" | "targetLabel"> = {},
+    extra: EventTarget = {},
+    eventPath = currentPath,
   ) {
     if (!/^[a-z0-9_.:-]{1,64}$/i.test(eventType)) return;
 
@@ -199,7 +222,7 @@ export function createTracker(options: MinilyticsOptions = {}) {
       eventType,
       sessionId: session.id,
       visitorId: getVisitorId(visitorMode, session.id),
-      path: cleanPath(new URL(window.location.href)),
+      path: eventPath,
       title: document.title || undefined,
       occurredAt: new Date().toISOString(),
       attribution: session.attribution,
@@ -208,11 +231,60 @@ export function createTracker(options: MinilyticsOptions = {}) {
     });
   }
 
+  function track(
+    eventType: string,
+    properties?: EventProperties,
+    extra: EventTarget = {},
+  ) {
+    emit(eventType, properties, extra);
+  }
+
   function pageview() {
-    const path = cleanPath(new URL(window.location.href));
-    if (path === lastPage) return;
-    lastPage = path;
+    currentPath = cleanPath(new URL(window.location.href));
+    if (currentPath === lastPage) return;
+    lastPage = currentPath;
     track("pageview");
+  }
+
+  function accrueEngagement() {
+    if (activeStarted === null) return;
+    const now = performance.now();
+    pendingEngagementMs += Math.max(0, now - activeStarted);
+    activeStarted = now;
+  }
+
+  function flushEngagement() {
+    accrueEngagement();
+    if (pendingEngagementMs < MIN_ENGAGEMENT_MS) return;
+
+    const engagementMs = Math.round(pendingEngagementMs);
+    pendingEngagementMs = 0;
+    track("engagement", { engagementMs });
+  }
+
+  function pauseEngagement() {
+    accrueEngagement();
+    activeStarted = null;
+    if (pendingEngagementMs >= MIN_ENGAGEMENT_MS) {
+      const engagementMs = Math.round(pendingEngagementMs);
+      pendingEngagementMs = 0;
+      track("engagement", { engagementMs });
+    }
+  }
+
+  function resumeEngagement() {
+    if (document.visibilityState === "visible" && activeStarted === null) {
+      activeStarted = performance.now();
+    }
+  }
+
+  function visibilityHandler() {
+    if (document.visibilityState === "hidden") pauseEngagement();
+    else resumeEngagement();
+  }
+
+  function pagehideHandler() {
+    pauseEngagement();
   }
 
   function clickHandler(event: MouseEvent) {
@@ -251,34 +323,96 @@ export function createTracker(options: MinilyticsOptions = {}) {
     });
   }
 
+  async function startWebVitals() {
+    const metricPath = currentPath;
+
+    try {
+      const { onCLS, onFCP, onINP, onLCP, onTTFB } = await import("web-vitals");
+      if (stopped) return;
+
+      const report = (metric: VitalMetric) => {
+        if (stopped) return;
+        emit(
+          "web_vital",
+          {
+            metric: metric.name,
+            value: Number(metric.value.toFixed(metric.name === "CLS" ? 4 : 1)),
+            delta: Number(metric.delta.toFixed(metric.name === "CLS" ? 4 : 1)),
+            rating: metric.rating ?? null,
+            metricId: metric.id,
+            navigationType: metric.navigationType ?? null,
+            metricPath,
+          },
+          {},
+          metricPath,
+        );
+      };
+
+      onCLS(report);
+      onFCP(report);
+      onINP(report);
+      onLCP(report);
+      onTTFB(report);
+    } catch {
+      // Performance APIs are best effort and must never affect the host site.
+    }
+  }
+
   function start() {
     writeSession(session);
 
     const originalPushState = history.pushState;
     const originalReplaceState = history.replaceState;
-    const afterNavigation = () => queueMicrotask(pageview);
+
+    const finishNavigation = () => {
+      currentPath = cleanPath(new URL(window.location.href));
+      if (autoPageviews) queueMicrotask(pageview);
+    };
 
     history.pushState = function (...args) {
+      if (autoEngagement) flushEngagement();
       originalPushState.apply(this, args);
-      afterNavigation();
+      finishNavigation();
     };
 
     history.replaceState = function (...args) {
+      if (autoEngagement) flushEngagement();
       originalReplaceState.apply(this, args);
-      afterNavigation();
+      finishNavigation();
     };
 
-    window.addEventListener("popstate", afterNavigation);
+    const popstateHandler = () => {
+      if (autoEngagement) flushEngagement();
+      finishNavigation();
+    };
+
+    window.addEventListener("popstate", popstateHandler);
     if (autoClicks) document.addEventListener("click", clickHandler, true);
     if (autoForms) document.addEventListener("submit", submitHandler, true);
+
+    if (autoEngagement) {
+      resumeEngagement();
+      document.addEventListener("visibilitychange", visibilityHandler);
+      window.addEventListener("pagehide", pagehideHandler);
+      engagementTimer = setInterval(flushEngagement, ENGAGEMENT_FLUSH_MS);
+    }
+
     if (autoPageviews) pageview();
+    if (autoWebVitals) void startWebVitals();
 
     return () => {
+      stopped = true;
+      if (autoEngagement) pauseEngagement();
+      if (engagementTimer) clearInterval(engagementTimer);
       history.pushState = originalPushState;
       history.replaceState = originalReplaceState;
-      window.removeEventListener("popstate", afterNavigation);
+      window.removeEventListener("popstate", popstateHandler);
       if (autoClicks) document.removeEventListener("click", clickHandler, true);
       if (autoForms) document.removeEventListener("submit", submitHandler, true);
+      if (autoEngagement) {
+        document.removeEventListener("visibilitychange", visibilityHandler);
+        window.removeEventListener("pagehide", pagehideHandler);
+      }
     };
   }
 
@@ -308,6 +442,8 @@ export function Analytics(props: MinilyticsOptions = {}) {
     props.autoPageviews,
     props.autoClicks,
     props.autoForms,
+    props.autoEngagement,
+    props.autoWebVitals,
     props.visitorMode,
   ]);
 

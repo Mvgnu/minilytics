@@ -2,48 +2,64 @@
 
 Tiny first-party analytics for sites you own.
 
-The browser only talks to the site it is visiting:
-
 ```text
 visitor
   -> https://your-site.example/api/minilytics
-  -> server-side proxy
+  -> same-origin server proxy
   -> https://analytics.example.com/api/collect
   -> Postgres
   -> Minilytics dashboard
 ```
 
-No external analytics script, pixel or cookie domain is loaded in the browser. The central collector is contacted server-to-server.
+The browser never loads an analytics script, pixel or cookie from the central analytics domain. The collector is contacted server-to-server.
 
 ## What it tracks
 
 - pageviews and SPA navigation
-- direct, organic search, social, referral and UTM attribution
-- automatic clicks and outbound clicks
-- automatic file downloads
-- automatic form submissions without form values
+- privacy-oriented unique visitor estimates + sessions
+- active visible-tab engagement time
+- engaged sessions, engagement rate and bounce rate
+- direct, organic, social, referral and UTM attribution
+- session acquisition and first-observed visitor acquisition
+- landing and exit pages
+- automatic clicks, outbound clicks, downloads and form submissions
+- site-configurable key events / goals
+- ordered funnels
 - custom business events
-- visitor/session/pageview graphs
-- top URLs and clicks per URL
-- source breakdown
+- Core Web Vitals + FCP/TTFB at p75
+- page-level visits, clicks and active engagement
 - recent session journeys
 - multiple projects in one dashboard
 
+Minilytics deliberately has no revenue/value model.
+
+## Measurement semantics
+
+A session uses the same 30-minute inactivity timeout as the tracker already used.
+
+An **engaged session** qualifies when any of these is true:
+
+- at least 10 seconds of active visible-tab engagement time
+- at least 2 pageviews
+- at least 1 configured key event
+
+Engagement rate is engaged sessions / sessions. Bounce rate is the inverse.
+
+Active engagement time is measured while the document is visible. The tracker flushes small `engagement` deltas on a timer, navigation, visibility changes and page hide. These are technical events and are hidden from the normal Actions report.
+
 ## Visitor counting
 
-By default the same-origin proxy estimates daily unique visitors without setting a persistent visitor cookie or localStorage identifier.
-
-For each analytics request it derives a site-scoped rotating identifier from data the web server already receives:
+By default the same-origin proxy estimates unique visitors without setting a persistent visitor cookie or localStorage identifier.
 
 ```text
 HMAC(site secret, site id + rotation bucket + IP address + User-Agent)
 ```
 
-The default rotation period is 24 hours. The raw IP address is never added to the event payload or stored in Postgres. The resulting identifier cannot be used to correlate visitors across different Minilytics sites because the site id and per-site secret are part of the HMAC input.
+The default rotation period is 24 hours. Raw IP addresses are never added to the analytics event payload or stored in Postgres. The site id and per-site secret make the resulting identifier site-scoped.
 
-This intentionally trades cross-day identity for less persistent tracking. A visitor returning on another day can be counted again, so the dashboard's visitor number should be understood as a privacy-oriented unique-visitor estimate rather than a count of identifiable people over the full date range.
+The tradeoff is intentional: a person returning after the rotation boundary can be counted again. The dashboard visitor metric is therefore a privacy-oriented estimate, not an identity graph.
 
-A rotating hash is still pseudonymous data, not a magic exemption from privacy law. Minilytics minimizes data collection, but deployments still need an appropriate legal basis and privacy information for their jurisdiction.
+A rotating hash is pseudonymous data, not a magic privacy-law exemption. Deployments still need an appropriate legal basis and privacy information for their jurisdiction.
 
 ## 1. Run the dashboard
 
@@ -57,9 +73,11 @@ npm run db:migrate
 npm run dev
 ```
 
-Set `DASHBOARD_PASSWORD` in production. Minilytics uses HTTP Basic auth for the dashboard and deliberately leaves `/api/collect` reachable for authenticated site proxies.
+`db:migrate` applies all numbered SQL migrations in `db/` in order. The migrations are idempotent.
 
-The dashboard runs on Next.js 16. Its request interception file is therefore `proxy.ts`; Next.js renamed the old `middleware.ts` convention to `proxy.ts` in v16.
+Set `DASHBOARD_PASSWORD` in production. The dashboard uses HTTP Basic auth and deliberately leaves `/api/collect` reachable for authenticated site proxies.
+
+The dashboard runs on Next.js 16, so request interception is implemented as `proxy.ts` rather than the old `middleware.ts` convention.
 
 ## 2. Register a site
 
@@ -77,13 +95,11 @@ MINILYTICS_SITE_ID=preiswert-leasen
 MINILYTICS_SITE_SECRET=...
 ```
 
-The secret is stored in Postgres only as SHA-256 and is only printed once. The tracked site's server also uses that secret as the HMAC key for rotating network visitor ids.
+The secret is stored centrally only as SHA-256 and is shown once. The tracked site's server also uses it as the HMAC key for rotating visitor ids.
 
 ## 3. Add it to a Next.js site
 
-The tracker lives in `packages/tracker` and is ready to publish as `@mvgnu/minilytics`.
-
-In the tracked site, set server-side environment variables:
+Set server-side environment variables:
 
 ```env
 MINILYTICS_COLLECTOR_URL=https://analytics.example.com/api/collect
@@ -123,11 +139,26 @@ export default function RootLayout({ children }) {
 
 That is the entire browser integration.
 
-`<Analytics />` automatically records the initial pageview, SPA navigation, clicks, outbound clicks, downloads and form submissions. It strips query strings from stored page paths and clicked URLs. UTM attribution is extracted separately.
+`<Analytics />` automatically records pageviews, SPA navigation, active engagement, Web Vitals, clicks, outbound clicks, downloads and form submissions. Query strings are stripped from stored page and target URLs; UTM attribution is extracted separately.
+
+### Tracker options
+
+```tsx
+<Analytics
+  autoPageviews
+  autoClicks
+  autoForms
+  autoEngagement
+  autoWebVitals
+  visitorMode="session"
+/>
+```
+
+All automatic measurement flags default to `true`.
+
+Web Vitals use the bundled `web-vitals` package and are sent back through the same first-party Minilytics endpoint. No CDN script is loaded. Minilytics records LCP, INP, CLS, FCP and TTFB and reports p75 plus sample counts in the dashboard.
 
 ### Proxy options
-
-Network visitor estimation and obvious-bot filtering are enabled by default:
 
 ```ts
 createMinilyticsProxy({
@@ -140,58 +171,70 @@ createMinilyticsProxy({
 });
 ```
 
-Set `networkVisitors: false` if you explicitly want the client-provided visitor id to be used instead. Increasing `visitorRotationHours` makes returning visitors linkable for longer and should be treated as a privacy/product decision, not merely an accuracy knob.
+The proxy normalizes forwarded IP chains to the first address, validates JSON in every visitor mode, caches its imported HMAC key, filters obvious bot user agents and enforces the request byte limit before forwarding.
 
-### Mark important clicks
+Set `networkVisitors: false` only when you deliberately want the client-provided visitor identity instead. Increasing `visitorRotationHours` increases linkability and is a privacy/product decision, not just an accuracy knob.
 
-Automatic clicks are useful, but explicit labels make the dashboard much better:
+## Key events / goals
+
+`outbound` is the default key event because outbound destination clicks are the primary conversion for many Minilytics deployments.
+
+Configure a site's key events with:
+
+```bash
+npm run site:goals -- \
+  --id preiswert-leasen \
+  --events outbound,lead
+```
+
+The dashboard shows event count, sessions with each goal, overall session key-event rate, and uses configured key events when calculating engaged sessions and funnels.
+
+Important clicks can still be labeled explicitly:
 
 ```tsx
-<a href={offer.url} data-minilytics="leasing-offer">
+<a href={offer.url} data-minilytics="dealer-outbound">
   Zum Angebot
 </a>
 ```
 
-The same attribute can label forms:
+Forms can use the same attribute. No input values are captured.
 
-```tsx
-<form data-minilytics="lead-form">...</form>
+## Funnels
+
+Every site gets a built-in session funnel:
+
+```text
+Sessions -> Engaged sessions -> Key-event sessions
 ```
 
-No input values are captured.
+You can add ordered custom funnels from pageviews, events and labeled targets:
 
-### Custom events
-
-The component exposes a tiny global API:
-
-```ts
-window.minilytics?.track("lead", {
-  provider: "leasingmarkt",
-  commission: 10,
-});
+```bash
+npm run site:funnel -- \
+  --id preiswert-leasen \
+  --name "Leasing outbound" \
+  --steps "page:/leasing/*,event:outbound"
 ```
 
-Custom event properties are capped at 4 KB.
+Supported step forms:
 
-### Client visitor modes
-
-The client still maintains a first-party `sessionStorage` session id so multi-page journeys and first-touch attribution survive navigation. `visitorMode` controls the additional client visitor id:
-
-```tsx
-<Analytics visitorMode="session" />    // default
-<Analytics visitorMode="persistent" /> // persistent localStorage id
-<Analytics visitorMode="none" />       // no client visitor id
+```text
+page:/leasing/bmw
+page:/leasing/*       # trailing * = prefix match
+event:outbound
+event:lead
+label:dealer-outbound
 ```
 
-When the default server-side `networkVisitors` mode is enabled, its rotating HMAC id replaces the client visitor id before the event is forwarded centrally. `persistent` is therefore mainly useful when `networkVisitors` is disabled and your consent/privacy setup deliberately supports cross-session identity.
+A session must hit the configured steps in order to advance through the funnel. Funnel counts are session counts, not raw event counts.
 
-First-party browser storage is not automatically exempt from privacy/consent requirements.
+## Acquisition scopes
 
-## Source attribution
+**Session acquisition** reports the source / detail / campaign attached to the current session and includes engaged-session and key-event-session counts.
 
-Attribution is captured on the landing page and kept for the session.
+**User acquisition** reports the first source Minilytics has observed for each visitor id active in the selected period. With the default 24-hour rotating network identity this is intentionally a short-lived first-observed identity; persistent browser identity only makes sense when deliberately enabled and legally appropriate.
 
-Rules:
+Attribution rules:
 
 - UTM present -> campaign
 - empty referrer -> direct
@@ -199,7 +242,29 @@ Rules:
 - Instagram/TikTok/Facebook/Reddit/X/LinkedIn/YouTube -> social
 - everything else -> referral
 
-Internal navigation never overwrites the session's original landing attribution.
+Internal navigation never overwrites the session's landing attribution.
+
+## Custom events
+
+```ts
+window.minilytics?.track("lead", {
+  provider: "leasingmarkt",
+});
+```
+
+Custom event properties are capped at 4 KB. Minilytics intentionally does not assign monetary value or revenue semantics to them.
+
+## Client visitor modes
+
+The client keeps a first-party `sessionStorage` session id so multi-page journeys and session attribution survive hard navigation.
+
+```tsx
+<Analytics visitorMode="session" />    // default
+<Analytics visitorMode="persistent" /> // localStorage visitor id
+<Analytics visitorMode="none" />       // no client visitor id
+```
+
+When the default server-side `networkVisitors` mode is enabled, the rotating HMAC visitor id replaces the client visitor id before forwarding centrally.
 
 ## Privacy shape
 
@@ -211,30 +276,19 @@ Minilytics intentionally does not collect or store:
 - mouse movement
 - full query strings
 - canvas/audio/font fingerprints
+- revenue or advertising audience data
 
-The network visitor id uses only the request IP and User-Agent already received by the same-origin server, keyed with the site's secret and rotated by default every 24 hours. The central collector still receives the User-Agent transiently so it can reduce it to a coarse device type before storage; the full value is not stored.
+The central collector receives the User-Agent transiently only so it can reduce it to a coarse device type; the full value is not stored.
 
-## Payload limits
-
-Both the same-origin proxy and the central collector enforce a 16 KiB request limit by streamed byte length rather than JavaScript string length. Oversized requests receive HTTP 413.
+Both the same-origin proxy and central collector enforce a 16 KiB request limit by streamed byte length. Oversized requests receive HTTP 413.
 
 ## Database
 
-The core model is intentionally `sites` + append-only `events`, with indexes for site/time, pages, sessions and sources.
+The core storage model remains intentionally small:
 
-Postgres is enough for this stage. There is no Redis, queue, ClickHouse or separate ingestion service yet.
+- `sites`: project metadata, key-event names and optional funnel definitions
+- `events`: append-only measurement stream
 
-## Next measurement layer
+Sessions, engagement, landing/exit pages, acquisition reports and funnels are derived from the event stream rather than copied into additional analytics tables.
 
-The next useful additions should be semantic rather than simply collecting more data:
-
-1. engaged sessions, engagement rate/bounce rate and active engagement time
-2. landing/exit pages and pages per session
-3. key events/goals and conversion rate
-4. source -> landing page -> key event funnels
-5. revenue/value attribution from custom events
-6. browser/OS breakdown from server request headers
-7. Core Web Vitals as aggregate page metrics
-8. date-range controls and period comparison
-9. standalone first-party script for WordPress/non-React sites
-10. retention/rollups only if raw event volume ever makes them necessary
+Postgres is enough for this stage. There is no Redis, queue, ClickHouse or separate ingestion service.
