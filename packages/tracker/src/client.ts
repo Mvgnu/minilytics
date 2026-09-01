@@ -8,6 +8,7 @@ export type MinilyticsOptions = {
   endpoint?: string;
   autoPageviews?: boolean;
   autoClicks?: boolean;
+  autoForms?: boolean;
   visitorMode?: VisitorMode;
 };
 
@@ -44,6 +45,7 @@ const SESSION_KEY = "minilytics.session.v1";
 const VISITOR_KEY = "minilytics.visitor.v1";
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_PROPERTIES_BYTES = 4096;
+const DOWNLOAD_EXTENSIONS = /\.(?:7z|avi|csv|docx?|exe|gz|mov|mp3|mp4|pdf|pptx?|rar|tar|wav|xlsx?|zip)$/i;
 
 function randomId() {
   return crypto.randomUUID();
@@ -112,19 +114,33 @@ function safeProperties(properties?: EventProperties) {
 }
 
 function targetUrl(element: Element) {
-  if (!(element instanceof HTMLAnchorElement) || !element.href) return undefined;
+  const raw =
+    element instanceof HTMLAnchorElement
+      ? element.href
+      : element instanceof HTMLFormElement
+        ? element.action
+        : "";
+  if (!raw) return undefined;
+
   try {
-    const url = new URL(element.href, window.location.href);
+    const url = new URL(raw, window.location.href);
     return `${url.origin}${url.pathname}`;
   } catch {
     return undefined;
   }
 }
 
+function isDownload(element: Element, url?: string) {
+  if (!(element instanceof HTMLAnchorElement)) return false;
+  if (element.hasAttribute("download")) return true;
+  return Boolean(url && DOWNLOAD_EXTENSIONS.test(new URL(url).pathname));
+}
+
 export function createTracker(options: MinilyticsOptions = {}) {
   const endpoint = options.endpoint ?? "/api/minilytics";
   const autoPageviews = options.autoPageviews ?? true;
   const autoClicks = options.autoClicks ?? true;
+  const autoForms = options.autoForms ?? true;
   const visitorMode = options.visitorMode ?? "session";
 
   let session =
@@ -210,7 +226,9 @@ export function createTracker(options: MinilyticsOptions = {}) {
     const url = targetUrl(element);
     let eventType = "click";
 
-    if (url) {
+    if (isDownload(element, url)) {
+      eventType = "download";
+    } else if (url) {
       try {
         if (new URL(url).origin !== window.location.origin) {
           eventType = "outbound";
@@ -223,12 +241,21 @@ export function createTracker(options: MinilyticsOptions = {}) {
     track(eventType, undefined, { targetUrl: url, targetLabel: label });
   }
 
+  function submitHandler(event: SubmitEvent) {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+
+    track("form_submit", undefined, {
+      targetUrl: targetUrl(form),
+      targetLabel: form.getAttribute("data-minilytics") || undefined,
+    });
+  }
+
   function start() {
     writeSession(session);
 
     const originalPushState = history.pushState;
     const originalReplaceState = history.replaceState;
-
     const afterNavigation = () => queueMicrotask(pageview);
 
     history.pushState = function (...args) {
@@ -243,6 +270,7 @@ export function createTracker(options: MinilyticsOptions = {}) {
 
     window.addEventListener("popstate", afterNavigation);
     if (autoClicks) document.addEventListener("click", clickHandler, true);
+    if (autoForms) document.addEventListener("submit", submitHandler, true);
     if (autoPageviews) pageview();
 
     return () => {
@@ -250,6 +278,7 @@ export function createTracker(options: MinilyticsOptions = {}) {
       history.replaceState = originalReplaceState;
       window.removeEventListener("popstate", afterNavigation);
       if (autoClicks) document.removeEventListener("click", clickHandler, true);
+      if (autoForms) document.removeEventListener("submit", submitHandler, true);
     };
   }
 
@@ -274,7 +303,13 @@ export function Analytics(props: MinilyticsOptions = {}) {
       stop();
       delete globalWindow.minilytics;
     };
-  }, []);
+  }, [
+    props.endpoint,
+    props.autoPageviews,
+    props.autoClicks,
+    props.autoForms,
+    props.visitorMode,
+  ]);
 
   return createElement("span", {
     "aria-hidden": true,
