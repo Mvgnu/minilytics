@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: minilytics
+      POSTGRES_USER: minilytics
+      POSTGRES_PASSWORD: minilytics
+    ports:
+      - "5432:5432"
+    volumes:
+      - minilytics-postgres:/var/lib/postgresql/data
+
+volumes:
+  minilytics-postgres:
