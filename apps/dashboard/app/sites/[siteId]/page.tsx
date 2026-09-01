@@ -20,7 +20,9 @@ function duration(ms: number) {
 }
 
 function vitalValue(metric: string, value: number) {
-  if (metric === "CLS") return number(value);
+  if (metric === "CLS") {
+    return new Intl.NumberFormat("en", { maximumFractionDigits: 4 }).format(value);
+  }
   return `${number(value)} ms`;
 }
 
