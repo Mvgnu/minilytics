@@ -21,8 +21,8 @@ function arg(name) {
 function eventNames(raw) {
   return (raw || "")
     .split(",")
-    .map((value) => value.trim())
-    .filter((value) => /^[a-z0-9_.:-]{1,64}$/i.test(value));
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => /^[a-z0-9_.:-]{1,64}$/.test(value));
 }
 
 function slug(value) {
@@ -42,8 +42,9 @@ function funnelSteps(raw) {
     .map((token) => {
       const separator = token.indexOf(":");
       if (separator < 1) return null;
-      const kind = token.slice(0, separator).trim();
-      const value = token.slice(separator + 1).trim();
+      const kind = token.slice(0, separator).trim().toLowerCase();
+      const rawValue = token.slice(separator + 1).trim();
+      const value = kind === "event" ? rawValue.toLowerCase() : rawValue;
       if (!value || !["page", "event", "label"].includes(kind)) return null;
       return { kind, value: value.slice(0, 2048) };
     })
@@ -55,7 +56,7 @@ try {
     const directory = new URL("../db/", import.meta.url);
     const migrations = (await readdir(directory))
       .filter((file) => /^\d+.*\.sql$/.test(file))
-      .sort();
+      .sort((a, b) => (parseInt(a, 10) - parseInt(b, 10)) || a.localeCompare(b));
 
     for (const file of migrations) {
       const migration = await readFile(new URL(file, directory), "utf8");
