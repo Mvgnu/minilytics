@@ -1,6 +1,6 @@
 {
   "name": "@mvgnu/minilytics",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tiny first-party analytics tracker and same-origin proxy for Minilytics",
   "type": "module",
   "exports": {
