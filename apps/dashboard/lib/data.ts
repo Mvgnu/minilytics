@@ -57,8 +57,8 @@ function optionalText(value: unknown, max = 2048) {
   return text(value, max) || null;
 }
 function validEventName(value: unknown) {
-  const event = text(value, 64);
-  return /^[a-z0-9_.:-]{1,64}$/i.test(event) ? event : "";
+  const event = text(value, 64).toLowerCase();
+  return /^[a-z0-9_.:-]{1,64}$/.test(event) ? event : "";
 }
 function safeProperties(value: unknown): Record<string, string | number | boolean | null> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -74,7 +74,8 @@ function parseKeyEvents(value: unknown) {
   if (!Array.isArray(value)) return ["outbound"];
   return value
     .filter((item): item is string => typeof item === "string")
-    .filter((item) => /^[a-z0-9_.:-]{1,64}$/i.test(item))
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => /^[a-z0-9_.:-]{1,64}$/.test(item))
     .slice(0, 32);
 }
 function parseFunnels(value: unknown): FunnelDefinition[] {
@@ -90,10 +91,11 @@ function parseFunnels(value: unknown): FunnelDefinition[] {
         .map((step) => {
           if (!step || typeof step !== "object" || Array.isArray(step)) return null;
           const candidate = step as Record<string, unknown>;
-          const kind = text(candidate.kind, 16);
-          const value = text(candidate.value, 2048);
-          if (!value || !["page", "event", "label"].includes(kind)) return null;
-          return { kind: kind as FunnelStep["kind"], value };
+          const kind = text(candidate.kind, 16).toLowerCase();
+          const rawValue = text(candidate.value, 2048);
+          const stepValue = kind === "event" ? rawValue.toLowerCase() : rawValue;
+          if (!stepValue || !["page", "event", "label"].includes(kind)) return null;
+          return { kind: kind as FunnelStep["kind"], value: stepValue };
         })
         .filter((step): step is FunnelStep => Boolean(step))
         .slice(0, 10);
