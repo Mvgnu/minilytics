@@ -33,17 +33,17 @@ async function readBodyWithLimit(request: Request, maxBytes = MAX_BODY_BYTES) {
   return { body, tooLarge: false };
 }
 
+function firstForwardedAddress(value: string | null) {
+  return value?.split(",")[0]?.trim().slice(0, 128) || "";
+}
+
 function requestIp(request: Request) {
-  const direct =
-    request.headers.get("cf-connecting-ip") ||
-    request.headers.get("x-real-ip") ||
-    request.headers.get("x-vercel-forwarded-for");
-
-  if (direct) return direct.trim().slice(0, 128);
-
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (!forwarded) return "";
-  return forwarded.split(",")[0]?.trim().slice(0, 128) || "";
+  return (
+    firstForwardedAddress(request.headers.get("cf-connecting-ip")) ||
+    firstForwardedAddress(request.headers.get("x-real-ip")) ||
+    firstForwardedAddress(request.headers.get("x-vercel-forwarded-for")) ||
+    firstForwardedAddress(request.headers.get("x-forwarded-for"))
+  );
 }
 
 function isLikelyBot(userAgent: string) {
@@ -52,39 +52,53 @@ function isLikelyBot(userAgent: string) {
   );
 }
 
-async function networkVisitorId(input: {
-  request: Request;
-  siteId: string;
-  siteSecret: string;
-  rotationHours: number;
-  userAgent: string;
-}) {
-  const ip = requestIp(input.request);
-  if (!ip || !input.userAgent) return "";
-
-  const rotationMs = Math.max(1, input.rotationHours) * 60 * 60 * 1000;
-  const bucket = Math.floor(Date.now() / rotationMs);
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(input.siteSecret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    encoder.encode(`${input.siteId}\0${bucket}\0${ip}\0${input.userAgent}`),
-  );
-
-  return Array.from(new Uint8Array(signature))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("")
-    .slice(0, 32);
+function parsePayload(rawBody: string) {
+  try {
+    const value = JSON.parse(rawBody) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return value as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 export function createMinilyticsProxy(options: ProxyOptions) {
+  const encoder = new TextEncoder();
+  let hmacKeyPromise: Promise<CryptoKey> | undefined;
+
+  function hmacKey() {
+    hmacKeyPromise ??= crypto.subtle.importKey(
+      "raw",
+      encoder.encode(options.siteSecret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    return hmacKeyPromise;
+  }
+
+  async function networkVisitorId(request: Request, userAgent: string) {
+    const ip = requestIp(request);
+    if (!ip || !userAgent) return "";
+
+    const rotationHours = Math.max(
+      1,
+      options.visitorRotationHours ?? DEFAULT_ROTATION_HOURS,
+    );
+    const rotationMs = rotationHours * 60 * 60 * 1000;
+    const bucket = Math.floor(Date.now() / rotationMs);
+    const signature = await crypto.subtle.sign(
+      "HMAC",
+      await hmacKey(),
+      encoder.encode(`${options.siteId}\0${bucket}\0${ip}\0${userAgent}`),
+    );
+
+    return Array.from(new Uint8Array(signature))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 32);
+  }
+
   return async function POST(request: Request) {
     const contentLength = Number(request.headers.get("content-length") || "0");
     if (contentLength > MAX_BODY_BYTES) {
@@ -95,30 +109,21 @@ export function createMinilyticsProxy(options: ProxyOptions) {
     if (tooLarge) return new Response(null, { status: 413 });
     if (!rawBody) return new Response(null, { status: 400 });
 
+    const payload = parsePayload(rawBody);
+    if (!payload) return new Response(null, { status: 400 });
+
     const userAgent = request.headers.get("user-agent") || "";
     if ((options.filterBots ?? true) && userAgent && isLikelyBot(userAgent)) {
       return new Response(null, { status: 204 });
     }
 
-    let body = rawBody;
     if (options.networkVisitors ?? true) {
-      try {
-        const payload = JSON.parse(rawBody) as Record<string, unknown>;
-        const visitorId = await networkVisitorId({
-          request,
-          siteId: options.siteId,
-          siteSecret: options.siteSecret,
-          rotationHours: options.visitorRotationHours ?? DEFAULT_ROTATION_HOURS,
-          userAgent,
-        });
-        if (visitorId) payload.visitorId = visitorId;
-        body = JSON.stringify(payload);
-      } catch {
-        return new Response(null, { status: 400 });
-      }
+      const visitorId = await networkVisitorId(request, userAgent);
+      if (visitorId) payload.visitorId = visitorId;
     }
 
-    if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
+    const body = JSON.stringify(payload);
+    if (encoder.encode(body).byteLength > MAX_BODY_BYTES) {
       return new Response(null, { status: 413 });
     }
 
