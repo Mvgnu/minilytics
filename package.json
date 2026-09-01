@@ -2,17 +2,14 @@
   "name": "minilytics",
   "private": true,
   "version": "0.1.0",
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
+  "workspaces": ["apps/*", "packages/*"],
   "scripts": {
     "dev": "npm --workspace @minilytics/dashboard run dev",
     "build": "npm --workspace @mvgnu/minilytics run build && npm --workspace @minilytics/dashboard run build",
     "db:migrate": "node scripts/setup.mjs migrate",
-    "site:create": "node scripts/setup.mjs site:create"
+    "site:create": "node scripts/setup.mjs site:create",
+    "site:goals": "node scripts/setup.mjs site:goals",
+    "site:funnel": "node scripts/setup.mjs site:funnel"
   },
-  "engines": {
-    "node": ">=20.9"
-  }
+  "engines": {"node": ">=20.9"}
 }
