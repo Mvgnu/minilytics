@@ -69,8 +69,8 @@ function classifySource(input: {
 
   if (utmSource || utmMedium) {
     return {
-      source: utmMedium || "campaign",
-      medium: "campaign",
+      source: "campaign",
+      medium: utmMedium || "campaign",
       detail: utmSource || null,
     };
   }
@@ -195,6 +195,7 @@ export async function ingestEvent(request: Request) {
       source,
       medium,
       source_detail,
+      campaign,
       target_url,
       target_label,
       device_type,
@@ -213,6 +214,7 @@ export async function ingestEvent(request: Request) {
       ${source.source},
       ${source.medium},
       ${source.detail},
+      ${optionalText(attribution.utmCampaign, 256)},
       ${optionalText(payload.targetUrl, 2048)},
       ${optionalText(payload.targetLabel, 256)},
       ${deviceType(userAgent)},
@@ -296,16 +298,19 @@ export async function getSiteDashboard(siteId: string, days = 30) {
     path: string;
     views: number;
     visitors: number;
+    clicks: number;
   }[]>`
     SELECT
       path,
-      COUNT(*)::int AS views,
-      COUNT(DISTINCT COALESCE(visitor_id, session_id))::int AS visitors
+      COUNT(*) FILTER (WHERE event_type = 'pageview')::int AS views,
+      COUNT(DISTINCT COALESCE(visitor_id, session_id))
+        FILTER (WHERE event_type = 'pageview')::int AS visitors,
+      COUNT(*) FILTER (WHERE event_type IN ('click', 'outbound'))::int AS clicks
     FROM events
     WHERE site_id = ${siteId}
-      AND event_type = 'pageview'
       AND occurred_at >= now() - ${days} * interval '1 day'
     GROUP BY path
+    HAVING COUNT(*) FILTER (WHERE event_type = 'pageview') > 0
     ORDER BY views DESC
     LIMIT 12
   `;
@@ -313,16 +318,18 @@ export async function getSiteDashboard(siteId: string, days = 30) {
   const sources = await sql<{
     source: string;
     detail: string | null;
+    campaign: string | null;
     sessions: number;
   }[]>`
     SELECT
       source,
       source_detail AS detail,
+      campaign,
       COUNT(DISTINCT session_id)::int AS sessions
     FROM events
     WHERE site_id = ${siteId}
       AND occurred_at >= now() - ${days} * interval '1 day'
-    GROUP BY source, source_detail
+    GROUP BY source, source_detail, campaign
     ORDER BY sessions DESC
     LIMIT 12
   `;

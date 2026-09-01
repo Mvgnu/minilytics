@@ -99,7 +99,7 @@ export default async function SitePage({
                 <span className="truncate" title={page.path}>
                   {page.path}
                 </span>
-                <span>{number(page.visitors)} visitors</span>
+                <span>{number(page.visitors)} visitors · {number(page.clicks)} clicks</span>
                 <b>{number(page.views)}</b>
               </div>
             ))}
@@ -117,11 +117,15 @@ export default async function SitePage({
             {data.sources.map((source) => (
               <div
                 className="tableRow"
-                key={`${source.source}-${source.detail ?? ""}`}
+                key={`${source.source}-${source.detail ?? ""}-${source.campaign ?? ""}`}
               >
                 <span>
                   {source.source}
-                  {source.detail ? <small>{source.detail}</small> : null}
+                  {source.detail || source.campaign ? (
+                    <small>
+                      {[source.detail, source.campaign].filter(Boolean).join(" · ")}
+                    </small>
+                  ) : null}
                 </span>
                 <span />
                 <b>{number(source.sessions)}</b>

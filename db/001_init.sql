@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS events (
   source text NOT NULL,
   medium text NOT NULL,
   source_detail text,
+  campaign text,
   target_url text,
   target_label text,
   device_type text,
