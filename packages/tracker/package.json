@@ -1,6 +1,6 @@
 {
   "name": "@mvgnu/minilytics",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Tiny first-party analytics tracker and same-origin proxy for Minilytics",
   "type": "module",
   "exports": {
@@ -13,17 +13,11 @@
       "import": "./dist/server.js"
     }
   },
-  "files": [
-    "dist"
-  ],
+  "files": ["dist"],
   "scripts": {
     "build": "tsc src/client.ts src/server.ts --outDir dist --declaration --module ESNext --target ES2022 --moduleResolution Bundler --jsx react-jsx --skipLibCheck"
   },
-  "peerDependencies": {
-    "react": ">=18"
-  },
-  "devDependencies": {
-    "@types/react": "^19.2.0",
-    "typescript": "^7.0.2"
-  }
+  "peerDependencies": {"react": ">=18"},
+  "dependencies": {"web-vitals": "^6.2.1"},
+  "devDependencies": {"@types/react": "^19.2.0", "typescript": "^7.0.2"}
 }
