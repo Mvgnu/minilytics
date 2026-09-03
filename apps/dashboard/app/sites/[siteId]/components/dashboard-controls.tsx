@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useMemo, useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useState, type ChangeEvent } from "react";
 
 type Range = {
   preset: string;
@@ -31,6 +31,11 @@ export function DashboardControls({
   const searchParams = useSearchParams();
   const [customFrom, setCustomFrom] = useState(range.fromInput);
   const [customTo, setCustomTo] = useState(range.toInput);
+
+  useEffect(() => {
+    setCustomFrom(range.fromInput);
+    setCustomTo(range.toInput);
+  }, [range.fromInput, range.toInput]);
 
   const activeCount = [filters.source, filters.landing, filters.exit, filters.keyEvent].filter(Boolean).length;
   const params = useMemo(() => new URLSearchParams(searchParams.toString()), [searchParams]);
