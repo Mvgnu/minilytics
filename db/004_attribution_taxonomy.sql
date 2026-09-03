@@ -64,9 +64,27 @@ ON events
 FOR EACH ROW
 EXECUTE FUNCTION minilytics_normalize_attribution();
 
--- Re-run the same canonicalization for historical rows so the dashboard changes
--- immediately after migration rather than only for newly ingested events.
+-- Re-run canonicalization only for rows that can be affected. This still scans
+-- the table once, but avoids rewriting unrelated events and the associated
+-- row locks, WAL volume, table bloat and autovacuum work.
 UPDATE events
 SET source = source,
     medium = medium,
-    source_detail = source_detail;
+    source_detail = source_detail
+WHERE source = 'internal'
+   OR lower(regexp_replace(COALESCE(source_detail, ''), '^www\.', '')) IN (
+     'chatgpt', 'chatgpt.com', 'chat.openai.com', 'openai', 'openai.com',
+     'perplexity', 'perplexity.ai', 'perplexity.com',
+     'copilot', 'copilot.com', 'copilot.microsoft.com',
+     'claude', 'claude.ai', 'anthropic', 'anthropic.com',
+     'gemini', 'gemini.google.com', 'bard.google.com',
+     'grok', 'grok.com', 'you.com', 'you', 'phind', 'phind.com',
+     'mistral', 'mistral.ai', 'chat.mistral.ai',
+     'baidu.com', 'm.baidu.com', 'www.baidu.com', 'baidu',
+     'startpage.com', 'www.startpage.com', 'startpage',
+     'swisscows.com', 'www.swisscows.com', 'swisscows',
+     'suche.web.de', 'web.de', 'search.brave.com', 'brave.com', 'brave',
+     'qwant.com', 'www.qwant.com', 'qwant',
+     'kagi.com', 'www.kagi.com', 'kagi',
+     'mojeek.com', 'www.mojeek.com', 'mojeek'
+   );

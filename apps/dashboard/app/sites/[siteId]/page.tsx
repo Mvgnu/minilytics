@@ -284,13 +284,17 @@ export default async function SitePage({
               {data.journeys.map((journey) => (
                 <article className="journey" key={journey.sessionId}>
                   <div className="journeyHead">
-                    <span>{journey.source}{journey.detail ? ` · ${journey.detail}` : ""}{journey.medium ? ` / ${journey.medium}` : ""}</span>
+                    <span>
+                      {journey.source}
+                      {journey.detail ? ` · ${journey.detail}` : ""}
+                      {journey.medium && journey.medium !== journey.source ? ` / ${journey.medium}` : ""}
+                    </span>
                     <code>{journey.sessionId.slice(0, 8)}</code>
                   </div>
                   <ol>
                     {journey.events.slice(-8).map((event, index) => (
                       <li key={`${event.occurredAt}-${index}`}>
-                        <time>{new Date(event.occurredAt).toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit" })}</time>
+                        <time>{new Date(event.occurredAt).toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" })}</time>
                         <span className="eventTag">{event.eventType}</span>
                         <span className="truncate">{event.targetLabel || event.targetUrl || event.path}</span>
                       </li>
