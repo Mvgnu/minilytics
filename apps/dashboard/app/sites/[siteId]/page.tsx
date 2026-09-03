@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { getSiteDashboard } from "../../../lib/data";
+import { DashboardControls } from "./components/dashboard-controls";
+import { TrafficChart } from "./components/traffic-chart";
+import { getExploreDashboard, type ExploreSearchParams } from "../../../lib/explore";
 
 export const dynamic = "force-dynamic";
 
@@ -20,62 +22,66 @@ function duration(ms: number) {
 }
 
 function vitalValue(metric: string, value: number) {
-  if (metric === "CLS") {
-    return new Intl.NumberFormat("en", { maximumFractionDigits: 4 }).format(value);
-  }
+  if (metric === "CLS") return new Intl.NumberFormat("en", { maximumFractionDigits: 4 }).format(value);
   return `${number(value)} ms`;
-}
-
-function TrafficChart({
-  data,
-}: {
-  data: Array<{ day: string; visitors: number; pageviews: number }>;
-}) {
-  const max = Math.max(1, ...data.map((point) => point.visitors));
-
-  return (
-    <div className="chart" aria-label="Visitors by day">
-      {data.map((point) => (
-        <div
-          className="barSlot"
-          key={point.day}
-          title={`${point.day}: ${point.visitors} visitors · ${point.pageviews} pageviews`}
-        >
-          <div
-            className="bar"
-            style={{ height: `${Math.max(4, (point.visitors / max) * 100)}%` }}
-          />
-        </div>
-      ))}
-    </div>
-  );
 }
 
 function AcquisitionName({
   source,
 }: {
-  source: { source: string; detail: string | null; campaign: string | null };
+  source: { source: string; medium: string; detail: string | null; campaign: string | null };
 }) {
   return (
     <span>
       {source.source}
-      {source.detail || source.campaign ? (
-        <small>{[source.detail, source.campaign].filter(Boolean).join(" · ")}</small>
+      {source.detail || source.medium || source.campaign ? (
+        <small>{[source.detail, source.medium !== source.source ? source.medium : null, source.campaign].filter(Boolean).join(" · ")}</small>
       ) : null}
     </span>
   );
 }
 
+function queryFor(data: NonNullable<Awaited<ReturnType<typeof getExploreDashboard>>>) {
+  const params = new URLSearchParams();
+  params.set("range", data.range.preset);
+  if (data.range.preset === "custom") {
+    params.set("from", data.range.fromInput);
+    params.set("to", data.range.toInput);
+  }
+  if (data.filters.source) params.set("source", data.filters.source);
+  if (data.filters.landing) params.set("landing", data.filters.landing);
+  if (data.filters.exit) params.set("exit", data.filters.exit);
+  if (data.filters.keyEvent) params.set("keyEvent", data.filters.keyEvent);
+  return params.toString();
+}
+
+function hrefWith(
+  siteId: string,
+  data: NonNullable<Awaited<ReturnType<typeof getExploreDashboard>>>,
+  patch: Partial<{ source: string; landing: string; exit: string; keyEvent: string }>,
+) {
+  const params = new URLSearchParams(queryFor(data));
+  for (const [key, value] of Object.entries(patch)) {
+    if (value) params.set(key, value);
+    else params.delete(key);
+  }
+  return `/sites/${siteId}?${params.toString()}`;
+}
+
 export default async function SitePage({
   params,
+  searchParams,
 }: {
   params: Promise<{ siteId: string }>;
+  searchParams: Promise<ExploreSearchParams>;
 }) {
   const { siteId } = await params;
-  const data = await getSiteDashboard(siteId, 30);
+  const query = await searchParams;
+  const data = await getExploreDashboard(siteId, query);
   if (!data) notFound();
 
   const goals = new Map(data.goals.map((goal) => [goal.eventType, goal]));
+  const preservedQuery = queryFor(data);
 
   return (
     <>
@@ -83,13 +89,16 @@ export default async function SitePage({
         <Link href="/">← All projects</Link>
       </div>
 
-      <section className="hero siteHero">
+      <section className="hero siteHero dashboardHero">
         <div>
-          <p className="eyebrow">Last 30 days</p>
+          <p className="eyebrow">{data.range.label}</p>
           <h1>{data.site.name}</h1>
           <p className="lede">{data.site.domain}</p>
         </div>
+        <Link className="secondaryButton" href={`/sites/${siteId}/journeys?${preservedQuery}`}>Explore journeys →</Link>
       </section>
+
+      <DashboardControls range={data.range} filters={data.filters} options={data.filterOptions} />
 
       <section className="stats four">
         <article className="stat"><span>Visitors</span><strong>{number(data.summary.visitors)}</strong></article>
@@ -107,10 +116,10 @@ export default async function SitePage({
 
       <section className="panel chartPanel">
         <div className="panelHeader">
-          <div><p className="eyebrow">Traffic</p><h2>Visitors</h2></div>
-          <span className="muted">Engaged = 10s active, 2+ pageviews, or a key event</span>
+          <div><p className="eyebrow">Traffic</p><h2>Visitors & sessions</h2></div>
+          <span className="muted">Hover or tap a point for exact values</span>
         </div>
-        {data.traffic.length ? <TrafficChart data={data.traffic} /> : <div className="empty">No traffic yet.</div>}
+        {data.traffic.length ? <TrafficChart data={data.traffic} /> : <div className="empty">No traffic for this selection.</div>}
       </section>
 
       <div className="grid2">
@@ -124,7 +133,7 @@ export default async function SitePage({
               const goal = goals.get(eventType);
               return (
                 <div className="tableRow" key={eventType}>
-                  <span>{eventType}</span>
+                  <span><Link className="drillLink" href={hrefWith(siteId, data, { keyEvent: `event:${eventType}` })}>{eventType}</Link></span>
                   <span>{number(goal?.sessions ?? 0)} sessions</span>
                   <b>{number(goal?.count ?? 0)}</b>
                 </div>
@@ -152,8 +161,8 @@ export default async function SitePage({
           <div className="panelHeader"><div><p className="eyebrow">Acquisition · session scope</p><h2>Session acquisition</h2></div></div>
           <div className="table">
             {data.sessionAcquisition.map((source) => (
-              <div className="tableRow fourCol" key={`${source.source}-${source.detail ?? ""}-${source.campaign ?? ""}`}>
-                <AcquisitionName source={source} />
+              <div className="tableRow fourCol" key={`${source.source}-${source.medium}-${source.detail ?? ""}-${source.campaign ?? ""}`}>
+                <Link className="drillLink" href={hrefWith(siteId, data, { source: `${source.source}|${source.detail ?? ""}` })}><AcquisitionName source={source} /></Link>
                 <span>{number(source.engagedSessions)} engaged</span>
                 <span>{number(source.keyEventSessions)} goals</span>
                 <b>{number(source.sessions)}</b>
@@ -164,10 +173,10 @@ export default async function SitePage({
 
         <section className="panel">
           <div className="panelHeader"><div><p className="eyebrow">Acquisition · visitor scope</p><h2>User acquisition</h2></div></div>
-          <p className="muted panelNote">First observed source for visitor IDs active in this period. Rotating network IDs limit how long this identity persists.</p>
+          <p className="muted panelNote">First observed source for visitor IDs active in this selection. Rotating network IDs limit how long this identity persists.</p>
           <div className="table">
             {data.userAcquisition.map((source) => (
-              <div className="tableRow" key={`${source.source}-${source.detail ?? ""}-${source.campaign ?? ""}`}>
+              <div className="tableRow" key={`${source.source}-${source.medium}-${source.detail ?? ""}-${source.campaign ?? ""}`}>
                 <AcquisitionName source={source} /><span /><b>{number(source.visitors)}</b>
               </div>
             ))}
@@ -181,7 +190,7 @@ export default async function SitePage({
           <div className="table">
             {data.landingPages.map((page) => (
               <div className="tableRow fourCol" key={page.path}>
-                <span className="truncate" title={page.path}>{page.path}</span>
+                <span className="truncate" title={page.path}><Link className="drillLink" href={hrefWith(siteId, data, { landing: page.path })}>{page.path}</Link></span>
                 <span>{percent(page.sessions ? (100 * page.engagedSessions) / page.sessions : 0)} engaged</span>
                 <span>{number(page.keyEventSessions)} goals</span>
                 <b>{number(page.sessions)}</b>
@@ -195,7 +204,7 @@ export default async function SitePage({
           <div className="table">
             {data.exitPages.map((page) => (
               <div className="tableRow" key={page.path}>
-                <span className="truncate" title={page.path}>{page.path}</span><span /><b>{number(page.exits)}</b>
+                <span className="truncate" title={page.path}><Link className="drillLink" href={hrefWith(siteId, data, { exit: page.path })}>{page.path}</Link></span><span /><b>{number(page.exits)}</b>
               </div>
             ))}
           </div>
@@ -243,7 +252,7 @@ export default async function SitePage({
               </article>
             ))}
           </div>
-        ) : <div className="empty">No Web Vitals samples yet.</div>}
+        ) : <div className="empty">No Web Vitals samples for this selection.</div>}
       </section>
 
       <div className="grid2">
@@ -262,17 +271,20 @@ export default async function SitePage({
                 </div>
               ))}
             </div>
-          ) : <div className="empty">No click or custom events yet.</div>}
+          ) : <div className="empty">No click or custom events for this selection.</div>}
         </section>
 
         <section className="panel">
-          <div className="panelHeader"><div><p className="eyebrow">Behavior</p><h2>Recent journeys</h2></div></div>
+          <div className="panelHeader">
+            <div><p className="eyebrow">Behavior</p><h2>Recent journeys</h2></div>
+            <Link className="panelLink" href={`/sites/${siteId}/journeys?${preservedQuery}`}>View all →</Link>
+          </div>
           {data.journeys.length ? (
             <div className="journeys">
               {data.journeys.map((journey) => (
                 <article className="journey" key={journey.sessionId}>
                   <div className="journeyHead">
-                    <span>{journey.source}{journey.detail ? ` · ${journey.detail}` : ""}</span>
+                    <span>{journey.source}{journey.detail ? ` · ${journey.detail}` : ""}{journey.medium ? ` / ${journey.medium}` : ""}</span>
                     <code>{journey.sessionId.slice(0, 8)}</code>
                   </div>
                   <ol>
@@ -287,7 +299,7 @@ export default async function SitePage({
                 </article>
               ))}
             </div>
-          ) : <div className="empty">No journeys yet.</div>}
+          ) : <div className="empty">No journeys for this selection.</div>}
         </section>
       </div>
     </>
