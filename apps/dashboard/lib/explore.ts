@@ -28,7 +28,6 @@ type SessionDimension = {
   firstAt: Date;
   lastAt: Date;
 };
-
 type JourneyEvent = {
   sessionId: string;
   eventType: string;
@@ -40,7 +39,6 @@ type JourneyEvent = {
   targetUrl: string | null;
   occurredAt: Date;
 };
-
 type SiteRow = {
   id: string;
   name: string;
@@ -48,8 +46,11 @@ type SiteRow = {
   keyEvents: unknown;
   funnels: unknown;
 };
+type Sql = ReturnType<typeof postgres>;
+type ResolvedQuery = ReturnType<typeof resolveExploreQuery>;
+type ExploreFilters = ResolvedQuery["filters"];
 
-let exploreClient: ReturnType<typeof postgres> | undefined;
+let exploreClient: Sql | undefined;
 
 function db() {
   if (exploreClient) return exploreClient;
@@ -195,24 +196,6 @@ function parseSourceToken(token: string) {
   };
 }
 
-function isEngaged(session: SessionDimension) {
-  return session.engagementMs >= 10_000 || session.pageviews >= 2 || session.keyEventCount > 0;
-}
-
-function matchesFilters(session: SessionDimension, filters: ReturnType<typeof resolveExploreQuery>["filters"]) {
-  const source = parseSourceToken(filters.source);
-  if (source && (session.source !== source.source || (session.detail ?? "") !== source.detail)) return false;
-  if (filters.landing && session.landingPath !== filters.landing) return false;
-  if (filters.exit && session.exitPath !== filters.exit) return false;
-  if (filters.keyEvent === "yes" && session.keyEventCount === 0) return false;
-  if (filters.keyEvent === "no" && session.keyEventCount > 0) return false;
-  if (filters.keyEvent.startsWith("event:")) {
-    const eventName = filters.keyEvent.slice(6);
-    if (!session.keyEvents.includes(eventName)) return false;
-  }
-  return true;
-}
-
 async function loadSite(siteId: string) {
   const sql = db();
   const [siteRow] = await sql<SiteRow[]>`
@@ -223,7 +206,6 @@ async function loadSite(siteId: string) {
   `;
   if (!siteRow) return null;
   return {
-    row: siteRow,
     site: {
       id: siteRow.id,
       name: siteRow.name,
@@ -234,127 +216,374 @@ async function loadSite(siteId: string) {
   };
 }
 
-async function loadSessionDimensions(siteId: string, from: Date, to: Date) {
-  const sql = db();
-  return sql<SessionDimension[]>`
-    SELECT
-      e.session_id AS "sessionId",
-      (array_agg(COALESCE(e.visitor_id, e.session_id) ORDER BY e.occurred_at ASC, e.id ASC))[1] AS "visitorKey",
-      (array_agg(e.source ORDER BY e.occurred_at ASC, e.id ASC))[1] AS source,
-      (array_agg(e.medium ORDER BY e.occurred_at ASC, e.id ASC))[1] AS medium,
-      (array_agg(e.source_detail ORDER BY e.occurred_at ASC, e.id ASC))[1] AS detail,
-      (array_agg(e.campaign ORDER BY e.occurred_at ASC, e.id ASC))[1] AS campaign,
-      (array_agg(e.path ORDER BY e.occurred_at ASC, e.id ASC) FILTER (WHERE e.event_type = 'pageview'))[1] AS "landingPath",
-      (array_agg(e.path ORDER BY e.occurred_at DESC, e.id DESC) FILTER (WHERE e.event_type = 'pageview'))[1] AS "exitPath",
-      COUNT(*) FILTER (WHERE e.event_type = 'pageview')::int AS pageviews,
-      COALESCE(SUM(CASE
-        WHEN e.event_type = 'engagement' AND COALESCE(e.properties->>'engagementMs', '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
-        THEN (e.properties->>'engagementMs')::double precision ELSE 0 END), 0)::double precision AS "engagementMs",
-      COUNT(*) FILTER (WHERE s.key_events ? e.event_type)::int AS "keyEventCount",
-      COALESCE(array_remove(array_agg(DISTINCT CASE WHEN s.key_events ? e.event_type THEN e.event_type END), NULL), ARRAY[]::text[]) AS "keyEvents",
-      COUNT(*) FILTER (WHERE e.event_type NOT IN ('pageview', 'engagement', 'web_vital'))::int AS "trackedEvents",
-      MIN(e.occurred_at) AS "firstAt",
-      MAX(e.occurred_at) AS "lastAt"
-    FROM events e
-    JOIN sites s ON s.id = e.site_id
-    WHERE e.site_id = ${siteId}
-      AND e.occurred_at >= ${from}
-      AND e.occurred_at < ${to}
-    GROUP BY e.session_id
-    ORDER BY MAX(e.occurred_at) DESC
+function sessionRollupCte(sql: Sql, siteId: string, from: Date, to: Date) {
+  return sql`
+    session_rollup AS (
+      SELECT
+        e.session_id AS session_id,
+        (array_agg(COALESCE(e.visitor_id, e.session_id) ORDER BY e.occurred_at ASC, e.id ASC))[1] AS visitor_key,
+        (array_agg(e.source ORDER BY e.occurred_at ASC, e.id ASC))[1] AS source,
+        (array_agg(e.medium ORDER BY e.occurred_at ASC, e.id ASC))[1] AS medium,
+        (array_agg(e.source_detail ORDER BY e.occurred_at ASC, e.id ASC))[1] AS detail,
+        (array_agg(e.campaign ORDER BY e.occurred_at ASC, e.id ASC))[1] AS campaign,
+        (array_agg(e.path ORDER BY e.occurred_at ASC, e.id ASC) FILTER (WHERE e.event_type = 'pageview'))[1] AS landing_path,
+        (array_agg(e.path ORDER BY e.occurred_at DESC, e.id DESC) FILTER (WHERE e.event_type = 'pageview'))[1] AS exit_path,
+        COUNT(*) FILTER (WHERE e.event_type = 'pageview')::int AS pageviews,
+        COALESCE(SUM(CASE
+          WHEN e.event_type = 'engagement' AND COALESCE(e.properties->>'engagementMs', '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
+          THEN (e.properties->>'engagementMs')::double precision ELSE 0 END), 0)::double precision AS engagement_ms,
+        COUNT(*) FILTER (WHERE s.key_events ? e.event_type)::int AS key_event_count,
+        COALESCE(array_remove(array_agg(DISTINCT CASE WHEN s.key_events ? e.event_type THEN e.event_type END), NULL), ARRAY[]::text[]) AS key_events,
+        COUNT(*) FILTER (WHERE e.event_type NOT IN ('pageview', 'engagement', 'web_vital'))::int AS tracked_events,
+        MIN(e.occurred_at) AS first_at,
+        MAX(e.occurred_at) AS last_at
+      FROM events e
+      JOIN sites s ON s.id = e.site_id
+      WHERE e.site_id = ${siteId}
+        AND e.occurred_at >= ${from}
+        AND e.occurred_at < ${to}
+      GROUP BY e.session_id
+    )
   `;
 }
 
-function groupCount<T>(rows: T[], key: (row: T) => string) {
-  const counts = new Map<string, number>();
-  for (const row of rows) counts.set(key(row), (counts.get(key(row)) ?? 0) + 1);
-  return counts;
+function filteredSessionsCte(sql: Sql, siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const source = parseSourceToken(filters.source);
+  const eventName = filters.keyEvent.startsWith("event:") ? filters.keyEvent.slice(6) : "";
+  return sql`
+    WITH ${sessionRollupCte(sql, siteId, from, to)},
+    filtered_sessions AS (
+      SELECT *
+      FROM session_rollup
+      WHERE TRUE
+        ${source ? sql`AND source = ${source.source} AND COALESCE(detail, '') = ${source.detail}` : sql``}
+        ${filters.landing ? sql`AND landing_path = ${filters.landing}` : sql``}
+        ${filters.exit ? sql`AND exit_path = ${filters.exit}` : sql``}
+        ${filters.keyEvent === "yes" ? sql`AND key_event_count > 0` : sql``}
+        ${filters.keyEvent === "no" ? sql`AND key_event_count = 0` : sql``}
+        ${eventName ? sql`AND ${eventName} = ANY(key_events)` : sql``}
+    )
+  `;
 }
 
-function makeFilterOptions(sessions: SessionDimension[], keyEvents: string[]) {
-  const sourceCounts = groupCount(sessions, (row) => sourceToken(row.source, row.detail));
-  const sourceMeta = new Map<string, { source: string; medium: string; detail: string | null }>();
-  for (const row of sessions) sourceMeta.set(sourceToken(row.source, row.detail), { source: row.source, medium: row.medium, detail: row.detail });
+function sessionColumns(sql: Sql) {
+  return sql`
+    session_id AS "sessionId",
+    visitor_key AS "visitorKey",
+    source,
+    medium,
+    detail,
+    campaign,
+    landing_path AS "landingPath",
+    exit_path AS "exitPath",
+    pageviews,
+    engagement_ms AS "engagementMs",
+    key_event_count AS "keyEventCount",
+    key_events AS "keyEvents",
+    tracked_events AS "trackedEvents",
+    first_at AS "firstAt",
+    last_at AS "lastAt"
+  `;
+}
 
-  const landingCounts = groupCount(sessions.filter((row) => row.landingPath), (row) => row.landingPath || "");
-  const exitCounts = groupCount(sessions.filter((row) => row.exitPath), (row) => row.exitPath || "");
-
+async function loadFilterOptions(siteId: string, from: Date, to: Date, keyEvents: string[]) {
+  const sql = db();
+  const base = sessionRollupCte(sql, siteId, from, to);
+  const [sources, landings, exits] = await Promise.all([
+    sql<{ source: string; medium: string; detail: string | null; count: number }[]>`
+      WITH ${base}
+      SELECT source, MIN(medium) AS medium, detail, COUNT(*)::int AS count
+      FROM session_rollup
+      GROUP BY source, detail
+      ORDER BY count DESC, source ASC, detail ASC NULLS FIRST
+      LIMIT 80
+    `,
+    sql<{ value: string; count: number }[]>`
+      WITH ${sessionRollupCte(sql, siteId, from, to)}
+      SELECT landing_path AS value, COUNT(*)::int AS count
+      FROM session_rollup
+      WHERE landing_path IS NOT NULL
+      GROUP BY landing_path
+      ORDER BY count DESC, landing_path ASC
+      LIMIT 100
+    `,
+    sql<{ value: string; count: number }[]>`
+      WITH ${sessionRollupCte(sql, siteId, from, to)}
+      SELECT exit_path AS value, COUNT(*)::int AS count
+      FROM session_rollup
+      WHERE exit_path IS NOT NULL
+      GROUP BY exit_path
+      ORDER BY count DESC, exit_path ASC
+      LIMIT 100
+    `,
+  ]);
   return {
-    sources: [...sourceCounts.entries()]
-      .map(([value, count]) => ({ value, count, ...sourceMeta.get(value)! }))
-      .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value))
-      .slice(0, 80),
-    landings: [...landingCounts.entries()]
-      .map(([value, count]) => ({ value, count }))
-      .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value))
-      .slice(0, 100),
-    exits: [...exitCounts.entries()]
-      .map(([value, count]) => ({ value, count }))
-      .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value))
-      .slice(0, 100),
+    sources: sources.map((row) => ({ ...row, value: sourceToken(row.source, row.detail) })),
+    landings,
+    exits,
     keyEvents,
   };
 }
 
-function summaryFromSessions(sessions: SessionDimension[]) {
-  const engagedSessions = sessions.filter(isEngaged).length;
-  const keyEventSessions = sessions.filter((row) => row.keyEventCount > 0).length;
-  const pageviews = sessions.reduce((sum, row) => sum + row.pageviews, 0);
-  const engagementMs = sessions.reduce((sum, row) => sum + row.engagementMs, 0);
-  const keyEventCount = sessions.reduce((sum, row) => sum + row.keyEventCount, 0);
-  const trackedEvents = sessions.reduce((sum, row) => sum + row.trackedEvents, 0);
-  const sessionCount = sessions.length;
-  return {
-    visitors: new Set(sessions.map((row) => row.visitorKey)).size,
-    sessions: sessionCount,
-    engagedSessions,
-    engagementRate: sessionCount ? (100 * engagedSessions) / sessionCount : 0,
-    bounceRate: sessionCount ? 100 - (100 * engagedSessions) / sessionCount : 0,
-    pageviews,
-    pagesPerSession: sessionCount ? pageviews / sessionCount : 0,
-    avgEngagementMs: sessionCount ? engagementMs / sessionCount : 0,
-    keyEventCount,
-    keyEventSessions,
-    keyEventRate: sessionCount ? (100 * keyEventSessions) / sessionCount : 0,
-    trackedEvents,
+async function loadSummary(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  const [row] = await sql<{
+    visitors: number; sessions: number; engagedSessions: number; engagementRate: number; bounceRate: number;
+    pageviews: number; pagesPerSession: number; avgEngagementMs: number; keyEventCount: number;
+    keyEventSessions: number; keyEventRate: number; trackedEvents: number;
+  }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT
+      COUNT(DISTINCT visitor_key)::int AS visitors,
+      COUNT(*)::int AS sessions,
+      COUNT(*) FILTER (WHERE engagement_ms >= 10000 OR pageviews >= 2 OR key_event_count > 0)::int AS "engagedSessions",
+      CASE WHEN COUNT(*) = 0 THEN 0 ELSE (100.0 * COUNT(*) FILTER (WHERE engagement_ms >= 10000 OR pageviews >= 2 OR key_event_count > 0) / COUNT(*))::double precision END AS "engagementRate",
+      CASE WHEN COUNT(*) = 0 THEN 0 ELSE (100.0 - 100.0 * COUNT(*) FILTER (WHERE engagement_ms >= 10000 OR pageviews >= 2 OR key_event_count > 0) / COUNT(*))::double precision END AS "bounceRate",
+      COALESCE(SUM(pageviews), 0)::int AS pageviews,
+      CASE WHEN COUNT(*) = 0 THEN 0 ELSE SUM(pageviews)::double precision / COUNT(*) END AS "pagesPerSession",
+      CASE WHEN COUNT(*) = 0 THEN 0 ELSE SUM(engagement_ms)::double precision / COUNT(*) END AS "avgEngagementMs",
+      COALESCE(SUM(key_event_count), 0)::int AS "keyEventCount",
+      COUNT(*) FILTER (WHERE key_event_count > 0)::int AS "keyEventSessions",
+      CASE WHEN COUNT(*) = 0 THEN 0 ELSE (100.0 * COUNT(*) FILTER (WHERE key_event_count > 0) / COUNT(*))::double precision END AS "keyEventRate",
+      COALESCE(SUM(tracked_events), 0)::int AS "trackedEvents"
+    FROM filtered_sessions
+  `;
+  return row ?? {
+    visitors: 0, sessions: 0, engagedSessions: 0, engagementRate: 0, bounceRate: 0,
+    pageviews: 0, pagesPerSession: 0, avgEngagementMs: 0, keyEventCount: 0,
+    keyEventSessions: 0, keyEventRate: 0, trackedEvents: 0,
   };
 }
 
-function groupSessionAcquisition(sessions: SessionDimension[]) {
-  const groups = new Map<string, {
+async function loadTraffic(siteId: string, from: Date, to: Date, filters: ExploreFilters, bucket: "hour" | "day") {
+  const sql = db();
+  const cte = filteredSessionsCte(sql, siteId, from, to, filters);
+  const rows = bucket === "hour"
+    ? await sql<{ bucket: Date; visitors: number; sessions: number }[]>`
+        ${cte}
+        SELECT date_trunc('hour', e.occurred_at) AS bucket,
+          COUNT(DISTINCT COALESCE(e.visitor_id, e.session_id))::int AS visitors,
+          COUNT(DISTINCT e.session_id)::int AS sessions
+        FROM events e
+        JOIN filtered_sessions fs ON fs.session_id = e.session_id
+        WHERE e.site_id = ${siteId} AND e.occurred_at >= ${from} AND e.occurred_at < ${to}
+        GROUP BY date_trunc('hour', e.occurred_at)
+        ORDER BY date_trunc('hour', e.occurred_at)
+      `
+    : await sql<{ bucket: Date; visitors: number; sessions: number }[]>`
+        ${cte}
+        SELECT date_trunc('day', e.occurred_at) AS bucket,
+          COUNT(DISTINCT COALESCE(e.visitor_id, e.session_id))::int AS visitors,
+          COUNT(DISTINCT e.session_id)::int AS sessions
+        FROM events e
+        JOIN filtered_sessions fs ON fs.session_id = e.session_id
+        WHERE e.site_id = ${siteId} AND e.occurred_at >= ${from} AND e.occurred_at < ${to}
+        GROUP BY date_trunc('day', e.occurred_at)
+        ORDER BY date_trunc('day', e.occurred_at)
+      `;
+  const formatter = bucket === "hour"
+    ? new Intl.DateTimeFormat("en", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" })
+    : new Intl.DateTimeFormat("en", { month: "short", day: "numeric", timeZone: "UTC" });
+  return rows.map((row) => ({ point: row.bucket.toISOString(), label: formatter.format(row.bucket), visitors: row.visitors, sessions: row.sessions }));
+}
+
+async function loadPages(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  return sql<{ path: string; views: number; visitors: number; clicks: number; avgEngagementMs: number }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT e.path,
+      COUNT(*) FILTER (WHERE e.event_type = 'pageview')::int AS views,
+      COUNT(DISTINCT COALESCE(e.visitor_id, e.session_id)) FILTER (WHERE e.event_type = 'pageview')::int AS visitors,
+      COUNT(*) FILTER (WHERE e.event_type IN ('click', 'outbound', 'download'))::int AS clicks,
+      CASE WHEN COUNT(*) FILTER (WHERE e.event_type = 'pageview') = 0 THEN 0 ELSE
+        (COALESCE(SUM(CASE WHEN e.event_type = 'engagement' AND COALESCE(e.properties->>'engagementMs', '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
+          THEN (e.properties->>'engagementMs')::double precision ELSE 0 END), 0) / COUNT(*) FILTER (WHERE e.event_type = 'pageview'))::double precision
+      END AS "avgEngagementMs"
+    FROM events e
+    JOIN filtered_sessions fs ON fs.session_id = e.session_id
+    WHERE e.site_id = ${siteId} AND e.occurred_at >= ${from} AND e.occurred_at < ${to}
+    GROUP BY e.path
+    HAVING COUNT(*) FILTER (WHERE e.event_type = 'pageview') > 0
+    ORDER BY views DESC
+    LIMIT 15
+  `;
+}
+
+async function loadGoals(siteId: string, from: Date, to: Date, filters: ExploreFilters, keyEvents: string[]) {
+  if (!keyEvents.length) return [];
+  const sql = db();
+  return sql<{ eventType: string; count: number; sessions: number; visitors: number }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT e.event_type AS "eventType", COUNT(*)::int AS count,
+      COUNT(DISTINCT e.session_id)::int AS sessions,
+      COUNT(DISTINCT COALESCE(e.visitor_id, e.session_id))::int AS visitors
+    FROM events e
+    JOIN filtered_sessions fs ON fs.session_id = e.session_id
+    WHERE e.site_id = ${siteId} AND e.occurred_at >= ${from} AND e.occurred_at < ${to}
+      AND e.event_type = ANY(${sql.array(keyEvents)})
+    GROUP BY e.event_type
+    ORDER BY count DESC
+  `;
+}
+
+async function loadSessionAcquisition(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  return sql<{
     source: string; medium: string; detail: string | null; campaign: string | null;
     sessions: number; engagedSessions: number; keyEventSessions: number;
-  }>();
-  for (const row of sessions) {
-    const key = `${row.source}\0${row.medium}\0${row.detail ?? ""}\0${row.campaign ?? ""}`;
-    const current = groups.get(key) ?? {
-      source: row.source, medium: row.medium, detail: row.detail, campaign: row.campaign,
-      sessions: 0, engagedSessions: 0, keyEventSessions: 0,
-    };
-    current.sessions += 1;
-    if (isEngaged(row)) current.engagedSessions += 1;
-    if (row.keyEventCount > 0) current.keyEventSessions += 1;
-    groups.set(key, current);
-  }
-  return [...groups.values()].sort((a, b) => b.sessions - a.sessions).slice(0, 15);
+  }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT source, medium, detail, campaign, COUNT(*)::int AS sessions,
+      COUNT(*) FILTER (WHERE engagement_ms >= 10000 OR pageviews >= 2 OR key_event_count > 0)::int AS "engagedSessions",
+      COUNT(*) FILTER (WHERE key_event_count > 0)::int AS "keyEventSessions"
+    FROM filtered_sessions
+    GROUP BY source, medium, detail, campaign
+    ORDER BY sessions DESC
+    LIMIT 15
+  `;
 }
 
-function groupLandingPages(sessions: SessionDimension[]) {
-  const groups = new Map<string, { path: string; sessions: number; engagedSessions: number; keyEventSessions: number }>();
-  for (const row of sessions) {
-    if (!row.landingPath) continue;
-    const current = groups.get(row.landingPath) ?? { path: row.landingPath, sessions: 0, engagedSessions: 0, keyEventSessions: 0 };
-    current.sessions += 1;
-    if (isEngaged(row)) current.engagedSessions += 1;
-    if (row.keyEventCount > 0) current.keyEventSessions += 1;
-    groups.set(row.landingPath, current);
-  }
-  return [...groups.values()].sort((a, b) => b.sessions - a.sessions).slice(0, 15);
+async function loadUserAcquisition(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  return sql<{ source: string; medium: string; detail: string | null; campaign: string | null; visitors: number }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)},
+    visitor_keys AS (
+      SELECT DISTINCT visitor_key FROM filtered_sessions
+    ),
+    first_touch AS (
+      SELECT DISTINCT ON (COALESCE(e.visitor_id, e.session_id))
+        COALESCE(e.visitor_id, e.session_id) AS visitor_key,
+        e.source, e.medium, e.source_detail AS detail, e.campaign
+      FROM events e
+      JOIN visitor_keys v ON v.visitor_key = COALESCE(e.visitor_id, e.session_id)
+      WHERE e.site_id = ${siteId}
+      ORDER BY COALESCE(e.visitor_id, e.session_id), e.occurred_at ASC, e.id ASC
+    )
+    SELECT source, medium, detail, campaign, COUNT(*)::int AS visitors
+    FROM first_touch
+    GROUP BY source, medium, detail, campaign
+    ORDER BY visitors DESC
+    LIMIT 15
+  `;
 }
 
-function groupExitPages(sessions: SessionDimension[]) {
-  const counts = groupCount(sessions.filter((row) => row.exitPath), (row) => row.exitPath || "");
-  return [...counts.entries()].map(([path, exits]) => ({ path, exits })).sort((a, b) => b.exits - a.exits).slice(0, 15);
+async function loadLandingPages(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  return sql<{ path: string; sessions: number; engagedSessions: number; keyEventSessions: number }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT landing_path AS path, COUNT(*)::int AS sessions,
+      COUNT(*) FILTER (WHERE engagement_ms >= 10000 OR pageviews >= 2 OR key_event_count > 0)::int AS "engagedSessions",
+      COUNT(*) FILTER (WHERE key_event_count > 0)::int AS "keyEventSessions"
+    FROM filtered_sessions
+    WHERE landing_path IS NOT NULL
+    GROUP BY landing_path
+    ORDER BY sessions DESC
+    LIMIT 15
+  `;
+}
+
+async function loadExitPages(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  return sql<{ path: string; exits: number }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT exit_path AS path, COUNT(*)::int AS exits
+    FROM filtered_sessions
+    WHERE exit_path IS NOT NULL
+    GROUP BY exit_path
+    ORDER BY exits DESC
+    LIMIT 15
+  `;
+}
+
+async function loadWebVitals(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  return sql<{ metric: string; p75: number; samples: number; goodPercent: number }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT e.properties->>'metric' AS metric,
+      percentile_cont(0.75) WITHIN GROUP (ORDER BY (e.properties->>'value')::double precision)::double precision AS p75,
+      COUNT(*)::int AS samples,
+      (100.0 * COUNT(*) FILTER (WHERE e.properties->>'rating' = 'good') / COUNT(*))::double precision AS "goodPercent"
+    FROM events e
+    JOIN filtered_sessions fs ON fs.session_id = e.session_id
+    WHERE e.site_id = ${siteId} AND e.occurred_at >= ${from} AND e.occurred_at < ${to}
+      AND e.event_type = 'web_vital'
+      AND e.properties->>'metric' IN ('LCP', 'INP', 'CLS', 'FCP', 'TTFB')
+      AND COALESCE(e.properties->>'value', '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
+    GROUP BY e.properties->>'metric'
+    ORDER BY CASE e.properties->>'metric' WHEN 'LCP' THEN 1 WHEN 'INP' THEN 2 WHEN 'CLS' THEN 3 WHEN 'FCP' THEN 4 WHEN 'TTFB' THEN 5 ELSE 6 END
+  `;
+}
+
+async function loadEvents(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  return sql<{ eventType: string; count: number }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT e.event_type AS "eventType", COUNT(*)::int AS count
+    FROM events e
+    JOIN filtered_sessions fs ON fs.session_id = e.session_id
+    WHERE e.site_id = ${siteId} AND e.occurred_at >= ${from} AND e.occurred_at < ${to}
+      AND e.event_type NOT IN ('pageview', 'engagement', 'web_vital')
+    GROUP BY e.event_type
+    ORDER BY count DESC
+    LIMIT 15
+  `;
+}
+
+async function loadFunnelRows(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  return sql<FunnelEvent[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT e.session_id AS "sessionId", e.event_type AS "eventType", e.path,
+      e.target_label AS "targetLabel", e.occurred_at AS "occurredAt"
+    FROM events e
+    JOIN filtered_sessions fs ON fs.session_id = e.session_id
+    WHERE e.site_id = ${siteId} AND e.occurred_at >= ${from} AND e.occurred_at < ${to}
+      AND e.event_type NOT IN ('engagement', 'web_vital')
+    ORDER BY e.session_id ASC, e.occurred_at ASC, e.id ASC
+  `;
+}
+
+async function loadFilteredSessions(
+  siteId: string,
+  from: Date,
+  to: Date,
+  filters: ExploreFilters,
+  limit: number,
+  offset = 0,
+) {
+  const sql = db();
+  return sql<SessionDimension[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT ${sessionColumns(sql)}
+    FROM filtered_sessions
+    ORDER BY last_at DESC, session_id DESC
+    LIMIT ${limit}
+    OFFSET ${offset}
+  `;
+}
+
+async function loadFilteredSessionCount(siteId: string, from: Date, to: Date, filters: ExploreFilters) {
+  const sql = db();
+  const [row] = await sql<{ count: number }[]>`
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT COUNT(*)::int AS count FROM filtered_sessions
+  `;
+  return row?.count ?? 0;
+}
+
+async function loadJourneyEvents(siteId: string, sessionIds: string[], from: Date, to: Date) {
+  if (!sessionIds.length) return [];
+  const sql = db();
+  return sql<JourneyEvent[]>`
+    SELECT session_id AS "sessionId", event_type AS "eventType", path, source, medium,
+      source_detail AS detail, target_label AS "targetLabel", target_url AS "targetUrl", occurred_at AS "occurredAt"
+    FROM events
+    WHERE site_id = ${siteId}
+      AND occurred_at >= ${from} AND occurred_at < ${to}
+      AND session_id = ANY(${sql.array(sessionIds)})
+      AND event_type NOT IN ('engagement', 'web_vital')
+    ORDER BY session_id ASC, occurred_at ASC, id ASC
+  `;
 }
 
 function matchesStep(step: FunnelStep, event: FunnelEvent) {
@@ -391,165 +620,6 @@ function evaluateFunnels(definitions: FunnelDefinition[], rows: FunnelEvent[]) {
   });
 }
 
-async function loadTraffic(siteId: string, sessionIds: string[], from: Date, to: Date, bucket: "hour" | "day") {
-  if (!sessionIds.length) return [];
-  const sql = db();
-  const rows = bucket === "hour"
-    ? await sql<{ bucket: Date; visitors: number; sessions: number }[]>`
-        SELECT date_trunc('hour', occurred_at) AS bucket,
-          COUNT(DISTINCT COALESCE(visitor_id, session_id))::int AS visitors,
-          COUNT(DISTINCT session_id)::int AS sessions
-        FROM events
-        WHERE site_id = ${siteId}
-          AND occurred_at >= ${from} AND occurred_at < ${to}
-          AND session_id = ANY(${sql.array(sessionIds)})
-        GROUP BY date_trunc('hour', occurred_at)
-        ORDER BY date_trunc('hour', occurred_at)
-      `
-    : await sql<{ bucket: Date; visitors: number; sessions: number }[]>`
-        SELECT date_trunc('day', occurred_at) AS bucket,
-          COUNT(DISTINCT COALESCE(visitor_id, session_id))::int AS visitors,
-          COUNT(DISTINCT session_id)::int AS sessions
-        FROM events
-        WHERE site_id = ${siteId}
-          AND occurred_at >= ${from} AND occurred_at < ${to}
-          AND session_id = ANY(${sql.array(sessionIds)})
-        GROUP BY date_trunc('day', occurred_at)
-        ORDER BY date_trunc('day', occurred_at)
-      `;
-  const formatter = bucket === "hour"
-    ? new Intl.DateTimeFormat("en", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" })
-    : new Intl.DateTimeFormat("en", { month: "short", day: "numeric", timeZone: "UTC" });
-  return rows.map((row) => ({ point: row.bucket.toISOString(), label: formatter.format(row.bucket), visitors: row.visitors, sessions: row.sessions }));
-}
-
-async function loadPages(siteId: string, sessionIds: string[], from: Date, to: Date) {
-  if (!sessionIds.length) return [];
-  const sql = db();
-  return sql<{ path: string; views: number; visitors: number; clicks: number; avgEngagementMs: number }[]>`
-    SELECT path,
-      COUNT(*) FILTER (WHERE event_type = 'pageview')::int AS views,
-      COUNT(DISTINCT COALESCE(visitor_id, session_id)) FILTER (WHERE event_type = 'pageview')::int AS visitors,
-      COUNT(*) FILTER (WHERE event_type IN ('click', 'outbound', 'download'))::int AS clicks,
-      CASE WHEN COUNT(*) FILTER (WHERE event_type = 'pageview') = 0 THEN 0 ELSE
-        (COALESCE(SUM(CASE WHEN event_type = 'engagement' AND COALESCE(properties->>'engagementMs', '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
-          THEN (properties->>'engagementMs')::double precision ELSE 0 END), 0) / COUNT(*) FILTER (WHERE event_type = 'pageview'))::double precision
-      END AS "avgEngagementMs"
-    FROM events
-    WHERE site_id = ${siteId}
-      AND occurred_at >= ${from} AND occurred_at < ${to}
-      AND session_id = ANY(${sql.array(sessionIds)})
-    GROUP BY path
-    HAVING COUNT(*) FILTER (WHERE event_type = 'pageview') > 0
-    ORDER BY views DESC
-    LIMIT 15
-  `;
-}
-
-async function loadGoals(siteId: string, sessionIds: string[], keyEvents: string[], from: Date, to: Date) {
-  if (!sessionIds.length || !keyEvents.length) return [];
-  const sql = db();
-  return sql<{ eventType: string; count: number; sessions: number; visitors: number }[]>`
-    SELECT event_type AS "eventType", COUNT(*)::int AS count,
-      COUNT(DISTINCT session_id)::int AS sessions,
-      COUNT(DISTINCT COALESCE(visitor_id, session_id))::int AS visitors
-    FROM events
-    WHERE site_id = ${siteId}
-      AND occurred_at >= ${from} AND occurred_at < ${to}
-      AND session_id = ANY(${sql.array(sessionIds)})
-      AND event_type = ANY(${sql.array(keyEvents)})
-    GROUP BY event_type
-    ORDER BY count DESC
-  `;
-}
-
-async function loadUserAcquisition(siteId: string, visitorKeys: string[]) {
-  if (!visitorKeys.length) return [];
-  const sql = db();
-  const rows = await sql<{ visitorKey: string; source: string; medium: string; detail: string | null; campaign: string | null }[]>`
-    SELECT DISTINCT ON (COALESCE(visitor_id, session_id))
-      COALESCE(visitor_id, session_id) AS "visitorKey", source, medium, source_detail AS detail, campaign
-    FROM events
-    WHERE site_id = ${siteId}
-      AND COALESCE(visitor_id, session_id) = ANY(${sql.array(visitorKeys)})
-    ORDER BY COALESCE(visitor_id, session_id), occurred_at ASC, id ASC
-  `;
-  const groups = new Map<string, { source: string; medium: string; detail: string | null; campaign: string | null; visitors: number }>();
-  for (const row of rows) {
-    const key = `${row.source}\0${row.medium}\0${row.detail ?? ""}\0${row.campaign ?? ""}`;
-    const current = groups.get(key) ?? { source: row.source, medium: row.medium, detail: row.detail, campaign: row.campaign, visitors: 0 };
-    current.visitors += 1;
-    groups.set(key, current);
-  }
-  return [...groups.values()].sort((a, b) => b.visitors - a.visitors).slice(0, 15);
-}
-
-async function loadWebVitals(siteId: string, sessionIds: string[], from: Date, to: Date) {
-  if (!sessionIds.length) return [];
-  const sql = db();
-  return sql<{ metric: string; p75: number; samples: number; goodPercent: number }[]>`
-    SELECT properties->>'metric' AS metric,
-      percentile_cont(0.75) WITHIN GROUP (ORDER BY (properties->>'value')::double precision)::double precision AS p75,
-      COUNT(*)::int AS samples,
-      (100.0 * COUNT(*) FILTER (WHERE properties->>'rating' = 'good') / COUNT(*))::double precision AS "goodPercent"
-    FROM events
-    WHERE site_id = ${siteId}
-      AND occurred_at >= ${from} AND occurred_at < ${to}
-      AND session_id = ANY(${sql.array(sessionIds)})
-      AND event_type = 'web_vital'
-      AND properties->>'metric' IN ('LCP', 'INP', 'CLS', 'FCP', 'TTFB')
-      AND COALESCE(properties->>'value', '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
-    GROUP BY properties->>'metric'
-    ORDER BY CASE properties->>'metric' WHEN 'LCP' THEN 1 WHEN 'INP' THEN 2 WHEN 'CLS' THEN 3 WHEN 'FCP' THEN 4 WHEN 'TTFB' THEN 5 ELSE 6 END
-  `;
-}
-
-async function loadEvents(siteId: string, sessionIds: string[], from: Date, to: Date) {
-  if (!sessionIds.length) return [];
-  const sql = db();
-  return sql<{ eventType: string; count: number }[]>`
-    SELECT event_type AS "eventType", COUNT(*)::int AS count
-    FROM events
-    WHERE site_id = ${siteId}
-      AND occurred_at >= ${from} AND occurred_at < ${to}
-      AND session_id = ANY(${sql.array(sessionIds)})
-      AND event_type NOT IN ('pageview', 'engagement', 'web_vital')
-    GROUP BY event_type
-    ORDER BY count DESC
-    LIMIT 15
-  `;
-}
-
-async function loadFunnelRows(siteId: string, sessionIds: string[], from: Date, to: Date) {
-  if (!sessionIds.length) return [];
-  const sql = db();
-  return sql<FunnelEvent[]>`
-    SELECT session_id AS "sessionId", event_type AS "eventType", path,
-      target_label AS "targetLabel", occurred_at AS "occurredAt"
-    FROM events
-    WHERE site_id = ${siteId}
-      AND occurred_at >= ${from} AND occurred_at < ${to}
-      AND session_id = ANY(${sql.array(sessionIds)})
-      AND event_type NOT IN ('engagement', 'web_vital')
-    ORDER BY session_id ASC, occurred_at ASC, id ASC
-  `;
-}
-
-async function loadJourneyEvents(siteId: string, sessionIds: string[], from: Date, to: Date) {
-  if (!sessionIds.length) return [];
-  const sql = db();
-  return sql<JourneyEvent[]>`
-    SELECT session_id AS "sessionId", event_type AS "eventType", path, source, medium,
-      source_detail AS detail, target_label AS "targetLabel", target_url AS "targetUrl", occurred_at AS "occurredAt"
-    FROM events
-    WHERE site_id = ${siteId}
-      AND occurred_at >= ${from} AND occurred_at < ${to}
-      AND session_id = ANY(${sql.array(sessionIds)})
-      AND event_type NOT IN ('engagement', 'web_vital')
-    ORDER BY session_id ASC, occurred_at ASC, id ASC
-  `;
-}
-
 function buildJourneys(sessions: SessionDimension[], events: JourneyEvent[]) {
   const bySession = new Map<string, JourneyEvent[]>();
   for (const event of events) {
@@ -574,44 +644,50 @@ function buildJourneys(sessions: SessionDimension[], events: JourneyEvent[]) {
   }));
 }
 
-async function loadContext(siteId: string, params: ExploreSearchParams) {
+export async function getExploreDashboard(siteId: string, params: ExploreSearchParams = {}) {
   const resolved = resolveExploreQuery(params);
   const loaded = await loadSite(siteId);
   if (!loaded) return null;
-  const allSessions = await loadSessionDimensions(siteId, resolved.range.from, resolved.range.to);
-  const filterOptions = makeFilterOptions(allSessions, loaded.site.keyEvents);
-  const filteredSessions = allSessions.filter((session) => matchesFilters(session, resolved.filters));
-  return { ...loaded, ...resolved, allSessions, filterOptions, filteredSessions };
-}
+  const { site, funnels: definitions } = loaded;
+  const { range, filters } = resolved;
 
-export async function getExploreDashboard(siteId: string, params: ExploreSearchParams = {}) {
-  const context = await loadContext(siteId, params);
-  if (!context) return null;
-  const { site, funnels: definitions, range, filters, filterOptions, filteredSessions } = context;
-  const sessionIds = filteredSessions.map((row) => row.sessionId);
-  const visitorKeys = Array.from(new Set<string>(filteredSessions.map((row) => row.visitorKey)));
-  const summary = summaryFromSessions(filteredSessions);
-
-  const [traffic, pages, goals, userAcquisition, webVitals, events] = await Promise.all([
-    loadTraffic(siteId, sessionIds, range.from, range.to, range.bucket),
-    loadPages(siteId, sessionIds, range.from, range.to),
-    loadGoals(siteId, sessionIds, site.keyEvents, range.from, range.to),
-    loadUserAcquisition(siteId, visitorKeys),
-    loadWebVitals(siteId, sessionIds, range.from, range.to),
-    loadEvents(siteId, sessionIds, range.from, range.to),
+  const [
+    filterOptions,
+    summary,
+    traffic,
+    pages,
+    goals,
+    sessionAcquisition,
+    userAcquisition,
+    landingPages,
+    exitPages,
+    webVitals,
+    events,
+    recentSessions,
+  ] = await Promise.all([
+    loadFilterOptions(siteId, range.from, range.to, site.keyEvents),
+    loadSummary(siteId, range.from, range.to, filters),
+    loadTraffic(siteId, range.from, range.to, filters, range.bucket),
+    loadPages(siteId, range.from, range.to, filters),
+    loadGoals(siteId, range.from, range.to, filters, site.keyEvents),
+    loadSessionAcquisition(siteId, range.from, range.to, filters),
+    loadUserAcquisition(siteId, range.from, range.to, filters),
+    loadLandingPages(siteId, range.from, range.to, filters),
+    loadExitPages(siteId, range.from, range.to, filters),
+    loadWebVitals(siteId, range.from, range.to, filters),
+    loadEvents(siteId, range.from, range.to, filters),
+    loadFilteredSessions(siteId, range.from, range.to, filters, 6),
   ]);
 
-  const sessionAcquisition = groupSessionAcquisition(filteredSessions);
-  const landingPages = groupLandingPages(filteredSessions);
-  const exitPages = groupExitPages(filteredSessions);
-
   let configuredFunnels: ReturnType<typeof evaluateFunnels> = [];
-  if (definitions.length && sessionIds.length) {
-    configuredFunnels = evaluateFunnels(definitions, await loadFunnelRows(siteId, sessionIds, range.from, range.to));
+  if (definitions.length && summary.sessions) {
+    configuredFunnels = evaluateFunnels(definitions, await loadFunnelRows(siteId, range.from, range.to, filters));
   }
 
-  const recentSessions = [...filteredSessions].sort((a, b) => b.lastAt.getTime() - a.lastAt.getTime()).slice(0, 6);
-  const journeys = buildJourneys(recentSessions, await loadJourneyEvents(siteId, recentSessions.map((row) => row.sessionId), range.from, range.to));
+  const journeys = buildJourneys(
+    recentSessions,
+    await loadJourneyEvents(siteId, recentSessions.map((row) => row.sessionId), range.from, range.to),
+  );
 
   const sessionFunnel = {
     id: "session-quality",
@@ -644,17 +720,28 @@ export async function getExploreDashboard(siteId: string, params: ExploreSearchP
 }
 
 export async function getJourneyExplorer(siteId: string, params: ExploreSearchParams = {}, pageSize = 50) {
-  const context = await loadContext(siteId, params);
-  if (!context) return null;
-  const { site, range, filters, filterOptions, filteredSessions } = context;
-  const totalSessions = filteredSessions.length;
+  const resolved = resolveExploreQuery(params);
+  const loaded = await loadSite(siteId);
+  if (!loaded) return null;
+  const { site } = loaded;
+  const { range, filters } = resolved;
+
+  const [filterOptions, totalSessions] = await Promise.all([
+    loadFilterOptions(siteId, range.from, range.to, site.keyEvents),
+    loadFilteredSessionCount(siteId, range.from, range.to, filters),
+  ]);
   const totalPages = Math.max(1, Math.ceil(totalSessions / pageSize));
-  const page = Math.min(context.page, totalPages);
-  const start = (page - 1) * pageSize;
-  const pageSessions = [...filteredSessions]
-    .sort((a, b) => b.lastAt.getTime() - a.lastAt.getTime())
-    .slice(start, start + pageSize);
-  const events = await loadJourneyEvents(siteId, pageSessions.map((row) => row.sessionId), range.from, range.to);
+  const page = Math.min(resolved.page, totalPages);
+  const pageSessions = await loadFilteredSessions(
+    siteId,
+    range.from,
+    range.to,
+    filters,
+    pageSize,
+    (page - 1) * pageSize,
+  );
+  const journeyEvents = await loadJourneyEvents(siteId, pageSessions.map((row) => row.sessionId), range.from, range.to);
+
   return {
     site,
     range,
@@ -664,6 +751,6 @@ export async function getJourneyExplorer(siteId: string, params: ExploreSearchPa
     pageSize,
     totalPages,
     totalSessions,
-    journeys: buildJourneys(pageSessions, events),
+    journeys: buildJourneys(pageSessions, journeyEvents),
   };
 }
