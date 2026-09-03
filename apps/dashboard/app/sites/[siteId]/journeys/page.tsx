@@ -73,7 +73,7 @@ export default async function JourneysPage({
                 <div className="journeyHead journeyHeadRich">
                   <div>
                     <strong>{journey.source}{journey.detail ? ` · ${journey.detail}` : ""}</strong>
-                    <span>{journey.medium}{journey.campaign ? ` · ${journey.campaign}` : ""}</span>
+                    <span>{[journey.medium !== journey.source ? journey.medium : null, journey.campaign].filter(Boolean).join(" · ") || "—"}</span>
                   </div>
                   <div className="journeyMeta">
                     <span>{duration(journey.engagementMs)} active</span>
@@ -97,6 +97,7 @@ export default async function JourneysPage({
                           day: "numeric",
                           hour: "2-digit",
                           minute: "2-digit",
+                          timeZone: "UTC",
                         })}
                       </time>
                       <span className="eventTag">{event.eventType}</span>
