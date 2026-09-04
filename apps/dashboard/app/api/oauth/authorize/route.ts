@@ -19,14 +19,18 @@ function escapeHtml(value: string) {
     .replaceAll("'", "&#039;");
 }
 
-function html(body: string, status = 200) {
+function html(body: string, status = 200, callbackOrigin?: string) {
+  const formAction = callbackOrigin
+    ? `form-action 'self' ${callbackOrigin}`
+    : "form-action 'self'";
+
   return new Response(body, {
     status,
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
       "content-security-policy":
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        `default-src 'none'; style-src 'unsafe-inline'; ${formAction}; base-uri 'none'; frame-ancestors 'none'`,
       "x-frame-options": "DENY",
       "referrer-policy": "no-referrer",
     },
@@ -40,7 +44,8 @@ export async function GET(request: Request) {
       request,
     );
     const signed = signAuthorizationRequest(authorization);
-    return html(`<!doctype html>
+    return html(
+      `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -72,7 +77,10 @@ export async function GET(request: Request) {
     <small>Protected resource: ${escapeHtml(authorization.resource)}</small>
   </main>
 </body>
-</html>`);
+</html>`,
+      200,
+      new URL(authorization.redirectUri).origin,
+    );
   } catch (error) {
     const response = oauthErrorResponse(error);
     return html(
