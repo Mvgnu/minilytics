@@ -1,6 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 
+const PUBLIC_PATHS = new Set([
+  "/api/collect",
+  "/api/mcp",
+  "/api/oauth/register",
+  "/api/oauth/token",
+  "/api/oauth/revoke",
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-authorization-server",
+]);
+
 export function proxy(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+  if (PUBLIC_PATHS.has(pathname) || pathname.startsWith("/.well-known/")) {
+    return NextResponse.next();
+  }
+
   const password = process.env.DASHBOARD_PASSWORD;
   if (!password) return NextResponse.next();
 
@@ -18,5 +33,5 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!api/collect|_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };
