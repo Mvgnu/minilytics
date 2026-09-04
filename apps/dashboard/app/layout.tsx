@@ -4,21 +4,22 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Minilytics",
-  description: "Small first-party analytics for your own sites.",
+  description: "Tiny first-party analytics for your projects",
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{ children: React.ReactNode }>) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
       <body>
         <header className="topbar">
-          <Link href="/" className="brand">
-            <span className="brandMark">m</span>
-            minilytics
+          <Link className="brand" href="/">
+            <span className="brandMark">M</span>
+            <span>Minilytics</span>
           </Link>
-          <span className="muted">first-party analytics</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
+            <Link className="muted" href="/mcp">Connect MCP</Link>
+            <span className="muted">First-party · Multi-site</span>
+          </div>
         </header>
         <main className="shell">{children}</main>
       </body>
