@@ -1,7 +1,10 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { DashboardControls } from "../components/dashboard-controls";
-import { getJourneyExplorer, type ExploreSearchParams } from "../../../../lib/explore";
+import { DashboardControlsV2 } from "../components/dashboard-controls-v2";
+import {
+  getEnhancedJourneyExplorer,
+  type ExploreSearchParams,
+} from "../../../../lib/enhanced-explore";
 
 export const dynamic = "force-dynamic";
 
@@ -12,7 +15,10 @@ function duration(ms: number) {
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
-function buildQuery(data: NonNullable<Awaited<ReturnType<typeof getJourneyExplorer>>>, page?: number) {
+function buildQuery(
+  data: NonNullable<Awaited<ReturnType<typeof getEnhancedJourneyExplorer>>>,
+  page?: number,
+) {
   const params = new URLSearchParams();
   params.set("range", data.range.preset);
   if (data.range.preset === "custom") {
@@ -36,7 +42,7 @@ export default async function JourneysPage({
 }) {
   const { siteId } = await params;
   const query = await searchParams;
-  const data = await getJourneyExplorer(siteId, query);
+  const data = await getEnhancedJourneyExplorer(siteId, query);
   if (!data) notFound();
 
   const overviewQuery = buildQuery(data);
@@ -51,11 +57,17 @@ export default async function JourneysPage({
         <div>
           <p className="eyebrow">Journey explorer · {data.range.label}</p>
           <h1>{data.site.name}</h1>
-          <p className="lede">{data.totalSessions.toLocaleString("en")} matching sessions · newest first</p>
+          <p className="lede">
+            {data.totalSessions.toLocaleString("en")} matching sessions · newest first
+          </p>
         </div>
       </section>
 
-      <DashboardControls range={data.range} filters={data.filters} options={data.filterOptions} />
+      <DashboardControlsV2
+        range={data.range}
+        filters={data.filters}
+        options={data.filterOptions}
+      />
 
       <section className="panel journeyExplorerPanel">
         <div className="panelHeader">
@@ -63,7 +75,9 @@ export default async function JourneysPage({
             <p className="eyebrow">Behavior</p>
             <h2>All recorded journeys</h2>
           </div>
-          <span className="muted">Page {data.page} / {data.totalPages}</span>
+          <span className="muted">
+            Page {data.page} / {data.totalPages}
+          </span>
         </div>
 
         {data.journeys.length ? (
@@ -72,20 +86,34 @@ export default async function JourneysPage({
               <article className="journey journeyFull" key={journey.sessionId}>
                 <div className="journeyHead journeyHeadRich">
                   <div>
-                    <strong>{journey.source}{journey.detail ? ` · ${journey.detail}` : ""}</strong>
-                    <span>{[journey.medium !== journey.source ? journey.medium : null, journey.campaign].filter(Boolean).join(" · ") || "—"}</span>
+                    <strong>
+                      {journey.source}
+                      {journey.detail ? ` · ${journey.detail}` : ""}
+                    </strong>
+                    <span>
+                      {journey.medium !== journey.source ? journey.medium : ""}
+                      {journey.campaign ? ` · ${journey.campaign}` : ""}
+                    </span>
                   </div>
                   <div className="journeyMeta">
                     <span>{duration(journey.engagementMs)} active</span>
-                    {journey.keyEvents.length ? <span className="goalPill">{journey.keyEvents.join(", ")}</span> : <span>No key event</span>}
+                    {journey.keyEvents.length ? (
+                      <span className="goalPill">{journey.keyEvents.join(", ")}</span>
+                    ) : (
+                      <span>No key event</span>
+                    )}
                     <code>{journey.sessionId.slice(0, 12)}</code>
                   </div>
                 </div>
 
                 <div className="journeyRoute">
-                  <span title={journey.landingPath ?? "No pageview"}>↳ {journey.landingPath ?? "No landing page"}</span>
+                  <span title={journey.landingPath ?? "No pageview"}>
+                    ↳ {journey.landingPath ?? "No landing page"}
+                  </span>
                   <span>→</span>
-                  <span title={journey.exitPath ?? "No pageview"}>↲ {journey.exitPath ?? "No exit page"}</span>
+                  <span title={journey.exitPath ?? "No pageview"}>
+                    ↲ {journey.exitPath ?? "No exit page"}
+                  </span>
                 </div>
 
                 <ol>
@@ -101,7 +129,10 @@ export default async function JourneysPage({
                         })}
                       </time>
                       <span className="eventTag">{event.eventType}</span>
-                      <span className="truncate" title={event.targetLabel || event.targetUrl || event.path}>
+                      <span
+                        className="truncate"
+                        title={event.targetLabel || event.targetUrl || event.path}
+                      >
                         {event.targetLabel || event.targetUrl || event.path}
                       </span>
                     </li>
@@ -116,9 +147,17 @@ export default async function JourneysPage({
 
         {data.totalPages > 1 ? (
           <nav className="pagination" aria-label="Journey pages">
-            {data.page > 1 ? <Link href={`?${buildQuery(data, data.page - 1)}`}>← Previous</Link> : <span />}
+            {data.page > 1 ? (
+              <Link href={`?${buildQuery(data, data.page - 1)}`}>← Previous</Link>
+            ) : (
+              <span />
+            )}
             <span>{data.totalSessions.toLocaleString("en")} sessions</span>
-            {data.page < data.totalPages ? <Link href={`?${buildQuery(data, data.page + 1)}`}>Next →</Link> : <span />}
+            {data.page < data.totalPages ? (
+              <Link href={`?${buildQuery(data, data.page + 1)}`}>Next →</Link>
+            ) : (
+              <span />
+            )}
           </nav>
         ) : null}
       </section>
