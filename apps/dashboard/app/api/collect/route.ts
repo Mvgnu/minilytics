@@ -55,7 +55,7 @@ export async function POST(request: Request) {
 
     const result = await ingestEvent(boundedRequest);
     if (result.status === 204) return new Response(null, { status: 204 });
-    return Response.json({ error: result.error }, { status: result.status });
+    return Response.json({ error: "error" in result ? result.error : "Invalid event." }, { status: result.status });
   } catch (error) {
     console.error("Minilytics ingest failed", error);
     return Response.json({ error: "Collector unavailable." }, { status: 500 });

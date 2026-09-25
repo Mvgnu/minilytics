@@ -1,3 +1,5 @@
+import { reportDb } from "./report-db";
+import { cachedReport } from "./report-cache";
 import { createHash, timingSafeEqual } from "node:crypto";
 import postgres from "postgres";
 
@@ -46,7 +48,7 @@ function db() {
   if (client) return client;
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is not configured.");
-  client = postgres(databaseUrl, { max: 10, idle_timeout: 20, connect_timeout: 10 });
+  client = postgres(databaseUrl, { max: 3, idle_timeout: 20, connect_timeout: 10, connection: {application_name: "minilytics-collector", statement_timeout: 10000} });
   return client;
 }
 
@@ -172,48 +174,60 @@ function evaluateFunnels(definitions: FunnelDefinition[], rows: FunnelEvent[]) {
   });
 }
 
-export async function ingestEvent(request: Request) {
-  const siteId = text(request.headers.get("x-minilytics-site"), 128);
+export async function ingestEvent(request: Request, trustedSiteId?: string): Promise<{status: number; error?: string}> {
+  const siteId = trustedSiteId ?? text(request.headers.get("x-minilytics-site"), 128);
   const secret = text(request.headers.get("x-minilytics-secret"), 256);
-  if (!siteId || !secret) return { status: 401, error: "Missing site credentials." };
+  if (!siteId || (!trustedSiteId && !secret)) return { status: 401, error: "Missing site credentials." };
   const sql = db();
   const [site] = await sql<{ secret_hash: string; domain: string }[]>`SELECT secret_hash, domain FROM sites WHERE id = ${siteId} LIMIT 1`;
-  if (!site || !secretsMatch(secret, site.secret_hash)) return { status: 401, error: "Invalid site credentials." };
+  if (!site || (!trustedSiteId && !secretsMatch(secret, site.secret_hash))) return { status: 401, error: "Invalid site credentials." };
 
   let payload: ClientPayload;
   try { payload = (await request.json()) as ClientPayload; } catch { return { status: 400, error: "Invalid JSON." }; }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return { status: 400, error: "Invalid event." };
   const eventType = validEventName(payload.eventType);
   const sessionId = text(payload.sessionId, 128);
   const path = text(payload.path, 2048);
   const occurredAt = new Date(text(payload.occurredAt, 64));
   if (!eventType || !sessionId || !path || Number.isNaN(occurredAt.getTime())) return { status: 400, error: "Invalid event." };
 
-  const attribution = payload.attribution ?? {};
-  const landingReferrer = text(attribution.landingReferrer, 2048);
-  const source = classifySource({
-    referrer: landingReferrer,
-    utmSource: text(attribution.utmSource, 256),
-    utmMedium: text(attribution.utmMedium, 256),
-    siteDomain: site.domain,
+  return sql.begin(async (sql) => {
+    const [session] = await sql<{attribution: NonNullable<ClientPayload["attribution"]>}[]>`
+      INSERT INTO analytics_sessions (site_id, session_id, attribution)
+      VALUES (${siteId}, ${sessionId}, ${sql.json((payload.attribution ?? {}) as postgres.JSONValue)})
+      ON CONFLICT (site_id, session_id) DO UPDATE SET last_seen_at = now()
+      RETURNING attribution
+    `;
+    const attribution = session.attribution;
+    const landingReferrer = text(attribution.landingReferrer, 2048);
+    const source = classifySource({
+      referrer: landingReferrer,
+      utmSource: text(attribution.utmSource, 256),
+      utmMedium: text(attribution.utmMedium, 256),
+      siteDomain: site.domain,
+    });
+    const userAgent = text(request.headers.get("x-minilytics-user-agent"), 1024);
+    const country = optionalText(request.headers.get("x-minilytics-country"), 8);
+    await sql`
+      INSERT INTO events (
+        site_id, session_id, visitor_id, event_type, path, title, landing_path, landing_referrer,
+        source, medium, source_detail, campaign, target_url, target_label, device_type, country, properties, occurred_at
+      ) VALUES (
+        ${siteId}, ${sessionId}, ${optionalText(payload.visitorId, 128)}, ${eventType}, ${path}, ${optionalText(payload.title, 512)},
+        ${optionalText(attribution.landingPath, 2048)}, ${optionalText(landingReferrer, 2048)}, ${source.source}, ${source.medium},
+        ${source.detail}, ${optionalText(attribution.utmCampaign, 256)}, ${optionalText(payload.targetUrl, 2048)},
+        ${optionalText(payload.targetLabel, 256)}, ${deviceType(userAgent)}, ${country}, ${sql.json(safeProperties(payload.properties))}, ${occurredAt}
+      )
+    `;
+    return { status: 204 };
   });
-  const userAgent = text(request.headers.get("x-minilytics-user-agent"), 1024);
-  const country = optionalText(request.headers.get("x-minilytics-country"), 8);
-  await sql`
-    INSERT INTO events (
-      site_id, session_id, visitor_id, event_type, path, title, landing_path, landing_referrer,
-      source, medium, source_detail, campaign, target_url, target_label, device_type, country, properties, occurred_at
-    ) VALUES (
-      ${siteId}, ${sessionId}, ${optionalText(payload.visitorId, 128)}, ${eventType}, ${path}, ${optionalText(payload.title, 512)},
-      ${optionalText(attribution.landingPath, 2048)}, ${optionalText(landingReferrer, 2048)}, ${source.source}, ${source.medium},
-      ${source.detail}, ${optionalText(attribution.utmCampaign, 256)}, ${optionalText(payload.targetUrl, 2048)},
-      ${optionalText(payload.targetLabel, 256)}, ${deviceType(userAgent)}, ${country}, ${sql.json(safeProperties(payload.properties))}, ${occurredAt}
-    )
-  `;
-  return { status: 204 };
 }
 
 export async function getSitesOverview(days = 30) {
-  const sql = db();
+  return cachedReport(`sites:${days}`, () => loadSitesOverview(days));
+}
+async function loadSitesOverview(days: number) {
+  const sql = reportDb();
   return sql<{ id: string; name: string; domain: string; visitors: number; pageviews: number; events: number }[]>`
     SELECT s.id, s.name, s.domain,
       COUNT(DISTINCT COALESCE(e.visitor_id, e.session_id))::int AS visitors,
