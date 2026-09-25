@@ -12,7 +12,7 @@ const PUBLIC_PATHS = new Set([
 
 export function proxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
-  if (PUBLIC_PATHS.has(pathname) || pathname.startsWith("/.well-known/")) {
+  if (pathname.startsWith("/api/edge-collect/") || PUBLIC_PATHS.has(pathname) || pathname.startsWith("/.well-known/")) {
     return NextResponse.next();
   }
 

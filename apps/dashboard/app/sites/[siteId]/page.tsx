@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { Realtime } from "./components/realtime";
 import { notFound } from "next/navigation";
 import { DashboardControlsV2 } from "./components/dashboard-controls-v2";
 import { TrafficChartV2 } from "./components/traffic-chart-v2";
@@ -109,7 +110,7 @@ export default async function SitePage({ params, searchParams }: { params: Promi
 
   return (
     <>
-      <div className="backRow"><Link href="/">← All projects</Link></div>
+      <div className="backRow"><Link prefetch={false} href="/">← All projects</Link></div>
 
       <section className="hero siteHero dashboardHero">
         <div>
@@ -121,8 +122,10 @@ export default async function SitePage({ params, searchParams }: { params: Promi
             {` · compared with ${data.comparison.label}`}
           </p>
         </div>
-        <Link className="secondaryButton" href={`/sites/${siteId}/journeys?${preservedQuery}`}>Explore journeys →</Link>
+        <Link prefetch={false} className="secondaryButton" href={`/sites/${siteId}/journeys?${preservedQuery}`}>Explore journeys →</Link>
       </section>
+
+      <Realtime siteId={siteId} domain={data.site.domain} />
 
       <DashboardControlsV2 range={data.range} filters={data.filters} options={data.filterOptions} />
 
@@ -150,7 +153,7 @@ export default async function SitePage({ params, searchParams }: { params: Promi
           <div className="table">
             {data.site.keyEvents.map((eventType) => {
               const goal = goals.get(eventType);
-              return <div className="tableRow" key={eventType}><span><Link className="drillLink" href={hrefWith(siteId, data, { keyEvent: `event:${eventType}` })}>{eventType}</Link></span><span>{number(goal?.sessions ?? 0)} sessions</span><b>{number(goal?.count ?? 0)}</b></div>;
+              return <div className="tableRow" key={eventType}><span><Link prefetch={false} className="drillLink" href={hrefWith(siteId, data, { keyEvent: `event:${eventType}` })}>{eventType}</Link></span><span>{number(goal?.sessions ?? 0)} sessions</span><b>{number(goal?.count ?? 0)}</b></div>;
             })}
           </div>
         </section>
@@ -166,7 +169,7 @@ export default async function SitePage({ params, searchParams }: { params: Promi
         <section className="panel">
           <div className="panelHeader"><div><p className="eyebrow">Acquisition · session scope</p><h2>Session acquisition</h2></div></div>
           <div className="table">
-            {data.sessionAcquisition.map((source) => <div className="tableRow fourCol" key={`${source.source}-${source.medium}-${source.detail ?? ""}-${source.campaign ?? ""}`}><Link className="drillLink" href={hrefWith(siteId, data, { source: `${source.source}|${source.detail ?? ""}` })}><AcquisitionName source={source} /></Link><span>{number(source.engagedSessions)} engaged</span><span>{number(source.keyEventSessions)} goals</span><b>{number(source.sessions)}</b></div>)}
+            {data.sessionAcquisition.map((source) => <div className="tableRow fourCol" key={`${source.source}-${source.medium}-${source.detail ?? ""}-${source.campaign ?? ""}`}><Link prefetch={false} className="drillLink" href={hrefWith(siteId, data, { source: `${source.source}|${source.detail ?? ""}` })}><AcquisitionName source={source} /></Link><span>{number(source.engagedSessions)} engaged</span><span>{number(source.keyEventSessions)} goals</span><b>{number(source.sessions)}</b></div>)}
           </div>
         </section>
         <section className="panel">
@@ -187,13 +190,13 @@ export default async function SitePage({ params, searchParams }: { params: Promi
         <section className="panel">
           <div className="panelHeader"><div><p className="eyebrow">Entry</p><h2>Landing pages</h2></div></div>
           <div className="table">
-            {data.landingPages.map((page) => <div className="tableRow fourCol" key={page.path}><span className="truncate" title={page.path}><Link className="drillLink" href={hrefWith(siteId, data, { landing: page.path })}>{page.path}</Link></span><span>{percent(page.sessions ? (100 * page.engagedSessions) / page.sessions : 0)} engaged</span><span>{number(page.keyEventSessions)} goals</span><b>{number(page.sessions)}</b></div>)}
+            {data.landingPages.map((page) => <div className="tableRow fourCol" key={page.path}><span className="truncate" title={page.path}><Link prefetch={false} className="drillLink" href={hrefWith(siteId, data, { landing: page.path })}>{page.path}</Link></span><span>{percent(page.sessions ? (100 * page.engagedSessions) / page.sessions : 0)} engaged</span><span>{number(page.keyEventSessions)} goals</span><b>{number(page.sessions)}</b></div>)}
           </div>
         </section>
         <section className="panel">
           <div className="panelHeader"><div><p className="eyebrow">Exit</p><h2>Exit pages</h2></div></div>
           <div className="table">
-            {data.exitPages.map((page) => <div className="tableRow" key={page.path}><span className="truncate" title={page.path}><Link className="drillLink" href={hrefWith(siteId, data, { exit: page.path })}>{page.path}</Link></span><span /><b>{number(page.exits)}</b></div>)}
+            {data.exitPages.map((page) => <div className="tableRow" key={page.path}><span className="truncate" title={page.path}><Link prefetch={false} className="drillLink" href={hrefWith(siteId, data, { exit: page.path })}>{page.path}</Link></span><span /><b>{number(page.exits)}</b></div>)}
           </div>
         </section>
       </div>
@@ -224,7 +227,7 @@ export default async function SitePage({ params, searchParams }: { params: Promi
           {data.events.length ? <div className="table">{data.events.map((event) => <div className="tableRow" key={event.eventType}><span>{event.eventType}</span><span>{data.site.keyEvents.includes(event.eventType) ? "key event" : ""}</span><b>{number(event.count)}</b></div>)}</div> : <div className="empty">No click or custom events for this selection.</div>}
         </section>
         <section className="panel">
-          <div className="panelHeader"><div><p className="eyebrow">Behavior</p><h2>Recent journeys</h2></div><Link className="panelLink" href={`/sites/${siteId}/journeys?${preservedQuery}`}>View all →</Link></div>
+          <div className="panelHeader"><div><p className="eyebrow">Behavior</p><h2>Recent journeys</h2></div><Link prefetch={false} className="panelLink" href={`/sites/${siteId}/journeys?${preservedQuery}`}>View all →</Link></div>
           {data.journeys.length ? <div className="journeys">{data.journeys.map((journey) => <article className="journey" key={journey.sessionId}><div className="journeyHead"><span>{journey.source}{journey.detail ? ` · ${journey.detail}` : ""}{journey.medium && journey.medium !== journey.source ? ` / ${journey.medium}` : ""}</span><code>{journey.sessionId.slice(0, 8)}</code></div><ol>{journey.events.slice(-8).map((event, index) => <li key={`${event.occurredAt}-${index}`}><time>{new Date(event.occurredAt).toLocaleTimeString("en", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" })}</time><span className="eventTag">{event.eventType}</span><span className="truncate">{event.targetLabel || event.targetUrl || event.path}</span></li>)}</ol></article>)}</div> : <div className="empty">No journeys for this selection.</div>}
         </section>
       </div>

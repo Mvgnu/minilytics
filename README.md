@@ -261,3 +261,37 @@ A rotating visitor hash is pseudonymous data rather than a legal exemption. Depl
 ## Database
 
 The analytics model remains `sites` plus append-only `events`. OAuth credentials use separate client/code/token tables; raw authorization codes and tokens are never stored. Postgres remains sufficient at this stage—there is no Redis, queue, Kafka or ClickHouse dependency.
+
+## Cookieless OVH edge integrations
+
+Srocket and Preiswert Leasen can route their existing same-origin `/api/minilytics/`
+endpoint to `/api/edge-collect/:siteId` on the dashboard's loopback listener. Nginx
+must replace `X-Minilytics-Client-IP` with the trusted client address and authenticate
+with `X-Minilytics-Edge-Secret` / `MINILYTICS_EDGE_SECRET`. Public requests without
+that server credential are rejected. The browser never receives this secret.
+
+This mode sets no cookies and reads no browser storage. An HMAC of site, network
+address and User-Agent locates a random session in Postgres. Lookup hashes rotate
+every 30 minutes; a previous-window match preserves an active session, and 30
+minutes of inactivity expires it. Run `node scripts/prune-sessions.mjs` each minute
+to remove expired keys. Raw addresses and full User-Agents never enter the analytics
+database. Matching is approximate: identical browsers behind a shared address can
+merge, and network/browser changes can split a visit. Session labels remain on
+historical events but expired lookup keys cannot link a later visit to them.
+
+First-touch attribution is kept in `analytics_sessions` and copied into each event.
+The cleanup also removes inactive attribution lookups after a day; event history
+is unchanged. Existing fragmented history is not stitched retroactively.
+
+Realtime shows activity **received** in the last 30 minutes, independently of date
+and report filters. It lists each user's latest source, medium and page, refreshes
+every ten seconds while visible, and uses its own small database pool. Historical
+reports share one transaction-local session rollup per period, coalesce duplicate
+requests, and cache a view for ten seconds. Heavy reports cannot consume collector
+or realtime connections. Cold long-range reports still depend on shared VPS load.
+
+For an existing installation, apply only the new migrations with
+`npm run db:migrate -- --only 006_sessions_realtime.sql`, then the same command for
+`007_cookieless_sessions.sql`. Back up events/sites first. `npm test` runs offline
+regressions. `npm run test:integration` needs a configured test database and an edge
+secret; it creates temporary QA sites and deletes only those sites on completion.

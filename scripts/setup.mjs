@@ -55,9 +55,10 @@ try {
   if (command === "migrate") {
     const directory = new URL("../db/", import.meta.url);
     const migrations = (await readdir(directory))
-      .filter((file) => /^\d+.*\.sql$/.test(file))
+      .filter((file) => /^\d+.*\.sql$/.test(file) && (!arg("only") || arg("only") === file))
       .sort((a, b) => (parseInt(a, 10) - parseInt(b, 10)) || a.localeCompare(b));
 
+    if (!migrations.length) throw new Error("No matching migrations.");
     for (const file of migrations) {
       const migration = await readFile(new URL(file, directory), "utf8");
       await sql.unsafe(migration);

@@ -1,11 +1,11 @@
-import postgres from "postgres";
-import { getExploreDashboard, getJourneyExplorer } from "./explore";
+import { cachedReport } from "./report-cache";
+import { reportDb as db, type ReportSql as Sql } from "./report-db";
+import { getExploreDashboard, getJourneyExplorer, sessionRollupCte, withSessionRollups } from "./explore";
 import type { ExploreSearchParams } from "./explore";
 
 export type { ExploreSearchParams } from "./explore";
 
 type SearchValue = string | string[] | undefined;
-type Sql = ReturnType<typeof postgres>;
 type Filters = {
   source: string;
   landing: string;
@@ -46,20 +46,6 @@ const PRESETS = new Set([
   "90d",
   "custom",
 ]);
-
-let enhancedClient: Sql | undefined;
-
-function db() {
-  if (enhancedClient) return enhancedClient;
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) throw new Error("DATABASE_URL is not configured.");
-  enhancedClient = postgres(databaseUrl, {
-    max: 10,
-    idle_timeout: 20,
-    connect_timeout: 10,
-  });
-  return enhancedClient;
-}
 
 function one(value: SearchValue) {
   return Array.isArray(value) ? value[0] || "" : value || "";
@@ -216,36 +202,7 @@ function filteredSessionsCte(
     : "";
 
   return sql`
-    WITH session_rollup AS (
-      SELECT
-        e.session_id,
-        (array_agg(COALESCE(e.visitor_id, e.session_id)
-          ORDER BY e.occurred_at ASC, e.id ASC))[1] AS visitor_key,
-        (array_agg(e.source ORDER BY e.occurred_at ASC, e.id ASC))[1] AS source,
-        (array_agg(e.source_detail ORDER BY e.occurred_at ASC, e.id ASC))[1] AS detail,
-        (array_agg(e.path ORDER BY e.occurred_at ASC, e.id ASC)
-          FILTER (WHERE e.event_type = 'pageview'))[1] AS landing_path,
-        (array_agg(e.path ORDER BY e.occurred_at DESC, e.id DESC)
-          FILTER (WHERE e.event_type = 'pageview'))[1] AS exit_path,
-        COUNT(*) FILTER (WHERE e.event_type = 'pageview')::int AS pageviews,
-        COALESCE(SUM(CASE
-          WHEN e.event_type = 'engagement'
-            AND COALESCE(e.properties->>'engagementMs', '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
-          THEN (e.properties->>'engagementMs')::double precision
-          ELSE 0 END), 0)::double precision AS engagement_ms,
-        COUNT(*) FILTER (WHERE s.key_events ? e.event_type)::int AS key_event_count,
-        COALESCE(array_remove(array_agg(DISTINCT CASE
-          WHEN s.key_events ? e.event_type THEN e.event_type END), NULL), ARRAY[]::text[]) AS key_events,
-        COUNT(*) FILTER (
-          WHERE e.event_type NOT IN ('pageview', 'engagement', 'web_vital')
-        )::int AS tracked_events
-      FROM events e
-      JOIN sites s ON s.id = e.site_id
-      WHERE e.site_id = ${siteId}
-        AND e.occurred_at >= ${from}
-        AND e.occurred_at < ${to}
-      GROUP BY e.session_id
-    ),
+    WITH ${sessionRollupCte(sql, siteId, from, to)},
     filtered_sessions AS (
       SELECT *
       FROM session_rollup
@@ -325,15 +282,16 @@ async function loadTrafficRows(
   bucket: "hour" | "day",
 ) {
   const sql = db();
+  const filtered = Boolean(filters.source || filters.landing || filters.exit || filters.keyEvent);
   if (bucket === "hour") {
     return sql<{ bucket: Date; visitors: number; sessions: number }[]>`
-      ${filteredSessionsCte(sql, siteId, from, to, filters)}
+      ${filtered ? filteredSessionsCte(sql, siteId, from, to, filters) : sql``}
       SELECT
         date_trunc('hour', e.occurred_at) AS bucket,
         COUNT(DISTINCT COALESCE(e.visitor_id, e.session_id))::int AS visitors,
         COUNT(DISTINCT e.session_id)::int AS sessions
       FROM events e
-      JOIN filtered_sessions fs ON fs.session_id = e.session_id
+      ${filtered ? sql`JOIN filtered_sessions fs ON fs.session_id = e.session_id` : sql``}
       WHERE e.site_id = ${siteId}
         AND e.occurred_at >= ${from}
         AND e.occurred_at < ${to}
@@ -343,13 +301,13 @@ async function loadTrafficRows(
   }
 
   return sql<{ bucket: Date; visitors: number; sessions: number }[]>`
-    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    ${filtered ? filteredSessionsCte(sql, siteId, from, to, filters) : sql``}
     SELECT
       date_trunc('day', e.occurred_at) AS bucket,
       COUNT(DISTINCT COALESCE(e.visitor_id, e.session_id))::int AS visitors,
       COUNT(DISTINCT e.session_id)::int AS sessions
     FROM events e
-    JOIN filtered_sessions fs ON fs.session_id = e.session_id
+    ${filtered ? sql`JOIN filtered_sessions fs ON fs.session_id = e.session_id` : sql``}
     WHERE e.site_id = ${siteId}
       AND e.occurred_at >= ${from}
       AND e.occurred_at < ${to}
@@ -425,18 +383,9 @@ async function loadDeviceBreakdown(
 ) {
   const sql = db();
   return sql<{ value: string; sessions: number }[]>`
-    ${filteredSessionsCte(sql, siteId, from, to, filters)},
-    dimensions AS (
-      SELECT fs.session_id,
-        (array_agg(COALESCE(NULLIF(e.device_type, ''), 'unknown')
-          ORDER BY e.occurred_at ASC, e.id ASC))[1] AS value
-      FROM filtered_sessions fs
-      JOIN events e ON e.session_id = fs.session_id AND e.site_id = ${siteId}
-      WHERE e.occurred_at >= ${from} AND e.occurred_at < ${to}
-      GROUP BY fs.session_id
-    )
-    SELECT value, COUNT(*)::int AS sessions
-    FROM dimensions
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT device AS value, COUNT(*)::int AS sessions
+    FROM filtered_sessions
     GROUP BY value
     ORDER BY sessions DESC, value ASC
   `;
@@ -450,18 +399,9 @@ async function loadCountryBreakdown(
 ) {
   const sql = db();
   return sql<{ value: string; sessions: number }[]>`
-    ${filteredSessionsCte(sql, siteId, from, to, filters)},
-    dimensions AS (
-      SELECT fs.session_id,
-        (array_agg(COALESCE(NULLIF(upper(e.country), ''), 'UNKNOWN')
-          ORDER BY e.occurred_at ASC, e.id ASC))[1] AS value
-      FROM filtered_sessions fs
-      JOIN events e ON e.session_id = fs.session_id AND e.site_id = ${siteId}
-      WHERE e.occurred_at >= ${from} AND e.occurred_at < ${to}
-      GROUP BY fs.session_id
-    )
-    SELECT value, COUNT(*)::int AS sessions
-    FROM dimensions
+    ${filteredSessionsCte(sql, siteId, from, to, filters)}
+    SELECT country AS value, COUNT(*)::int AS sessions
+    FROM filtered_sessions
     GROUP BY value
     ORDER BY sessions DESC, value ASC
     LIMIT 15
@@ -471,9 +411,10 @@ async function loadCountryBreakdown(
 async function loadFreshness(siteId: string) {
   const sql = db();
   const [row] = await sql<{ latestEventAt: Date | null }[]>`
-    SELECT MAX(received_at) AS "latestEventAt"
+    SELECT received_at AS "latestEventAt"
     FROM events
     WHERE site_id = ${siteId}
+    ORDER BY received_at DESC LIMIT 1
   `;
   return row?.latestEventAt ?? null;
 }
@@ -482,9 +423,21 @@ export async function getEnhancedDashboard(
   siteId: string,
   params: ExploreSearchParams = {},
 ) {
+  const key = JSON.stringify([siteId, ...["range", "from", "to", "source", "landing", "exit", "keyEvent"].map(k => one(params[k]))]);
+  return cachedReport(key, () => loadDashboard(siteId, params));
+}
+
+async function loadDashboard(siteId: string, params: ExploreSearchParams) {
   const range = resolveEnhancedRange(params);
+  const baseRange = { from: range.from, to: range.to };
+  // Base reports and comparisons share exactly the same event cutoff.
+  return withSessionRollups(siteId, [baseRange, {from: range.comparisonFrom, to: range.comparisonTo}],
+    () => loadEnhancedDashboard(siteId, params, range, baseRange.to));
+}
+
+async function loadEnhancedDashboard(siteId: string, params: ExploreSearchParams, range: ReturnType<typeof resolveEnhancedRange>, baseTo: Date) {
   const filters = filtersFrom(params);
-  const base = await getExploreDashboard(siteId, baseParams(params, range));
+  const base = await getExploreDashboard(siteId, baseParams(params, range), {from: range.from, to: baseTo});
   if (!base) return null;
 
   const [
@@ -498,7 +451,7 @@ export async function getEnhancedDashboard(
     loadTraffic(
       siteId,
       range.from,
-      range.to,
+      baseTo,
       filters,
       range.bucket,
       range.selectedDays,
@@ -512,8 +465,8 @@ export async function getEnhancedDashboard(
       range.selectedDays,
     ),
     loadSummary(siteId, range.comparisonFrom, range.comparisonTo, filters),
-    loadDeviceBreakdown(siteId, range.from, range.to, filters),
-    loadCountryBreakdown(siteId, range.from, range.to, filters),
+    loadDeviceBreakdown(siteId, range.from, baseTo, filters),
+    loadCountryBreakdown(siteId, range.from, baseTo, filters),
     loadFreshness(siteId),
   ]);
 

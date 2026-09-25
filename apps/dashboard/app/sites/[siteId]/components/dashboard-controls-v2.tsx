@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useState, useOptimistic, useTransition, type ChangeEvent } from "react";
 import styles from "./analytics-v2.module.css";
 
 type Range = {
@@ -54,6 +54,8 @@ export function DashboardControlsV2({
   options: FilterOptions;
 }) {
   const router = useRouter();
+  const [pending, startTransition] = useTransition();
+  const [selection, setSelection] = useOptimistic({range: range.preset, ...filters});
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const [customFrom, setCustomFrom] = useState(range.fromInput);
@@ -78,7 +80,10 @@ export function DashboardControlsV2({
     }
     if (resetPage) next.delete("page");
     const query = next.toString();
-    router.push(query ? `${pathname}?${query}` : pathname);
+    startTransition(() => {
+      setSelection(current => ({...current, ...Object.fromEntries(Object.entries(update).map(([key, value]) => [key, value ?? ""]))}));
+      router.push(query ? `${pathname}?${query}` : pathname, {scroll: false});
+    });
   }
 
   function setPreset(value: string) {
@@ -130,13 +135,13 @@ export function DashboardControlsV2({
   ].filter((value): value is { key: string; label: string } => Boolean(value));
 
   return (
-    <section className={styles.controlDeck} aria-label="Analytics controls">
+    <section className={styles.controlDeck} aria-label="Analytics controls" aria-busy={pending}>
       <div className={styles.controlTop}>
         <div className={styles.rangeGroup}>
           <label>
             <span>Period</span>
-            <select
-              value={range.preset}
+            <select disabled={pending}
+              value={selection.range}
               onChange={(event: ChangeEvent<HTMLSelectElement>) =>
                 setPreset(event.target.value)
               }
@@ -150,7 +155,7 @@ export function DashboardControlsV2({
             </select>
           </label>
 
-          {range.preset === "custom" ? (
+          {selection.range === "custom" ? (
             <div className={styles.customDates}>
               <input
                 type="date"
@@ -186,8 +191,8 @@ export function DashboardControlsV2({
       <div className={styles.filterGrid}>
         <label>
           <span>Source</span>
-          <select
-            value={filters.source}
+          <select disabled={pending}
+            value={selection.source}
             onChange={(event: ChangeEvent<HTMLSelectElement>) =>
               navigate({ source: event.target.value || null })
             }
@@ -208,8 +213,8 @@ export function DashboardControlsV2({
 
         <label>
           <span>Landing page</span>
-          <select
-            value={filters.landing}
+          <select disabled={pending}
+            value={selection.landing}
             onChange={(event: ChangeEvent<HTMLSelectElement>) =>
               navigate({ landing: event.target.value || null })
             }
@@ -225,8 +230,8 @@ export function DashboardControlsV2({
 
         <label>
           <span>Exit page</span>
-          <select
-            value={filters.exit}
+          <select disabled={pending}
+            value={selection.exit}
             onChange={(event: ChangeEvent<HTMLSelectElement>) =>
               navigate({ exit: event.target.value || null })
             }
@@ -242,8 +247,8 @@ export function DashboardControlsV2({
 
         <label>
           <span>Key event</span>
-          <select
-            value={filters.keyEvent}
+          <select disabled={pending}
+            value={selection.keyEvent}
             onChange={(event: ChangeEvent<HTMLSelectElement>) =>
               navigate({ keyEvent: event.target.value || null })
             }
@@ -261,7 +266,7 @@ export function DashboardControlsV2({
       </div>
 
       <div className={styles.controlFoot}>
-        <span>{range.label}</span>
+        <span role="status">{pending ? "Updating counts…" : range.label}</span>
         {activeFilters.length ? (
           <div className={styles.activeFilters} aria-label="Active filters">
             {activeFilters.map((filter) => (
